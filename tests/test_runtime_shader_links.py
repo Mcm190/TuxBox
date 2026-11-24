@@ -77,6 +77,24 @@ class RuntimeShaderLinks(unittest.TestCase):
                     path.write_bytes(old)
                 self.assertEqual(pipeline.call_count, 4)
 
+    def test_compile_request_accepts_profile_with_trailing_whitespace(self):
+        result = portable_program(0, b"main")
+        key, source = self.request(portable_program(0, b"r0.z"))
+
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_bytes(b"void main() {}")
+                args[args.index("--profile-out") + 1].write_text("gs_6_0\r\n")
+            elif args[0] == "dxc":
+                self.assertEqual(args[args.index("-T") + 1], "gs_6_0")
+                args[args.index("-Fo") + 1].write_bytes(result)
+            else:
+                self.assertEqual(args[0], "dxv")
+
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run):
+            self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
+            self.assertEqual((self.session / (key + ".cso")).read_bytes(), result)
+
     def test_rejects_native_code_non_pixel_dxil_and_non_regular_input(self):
         for program in [b"Xbox-native shader", portable_program(1, b"r0.z")]:
             key, source = self.request(program)

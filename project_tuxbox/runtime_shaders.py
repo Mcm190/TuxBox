@@ -141,7 +141,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             marker.write_text(key, encoding="ascii")
             os.replace(marker, refusal)
             raise ShaderRefused(str(error), cached=False) from error
-        target = profile.read_text()
+        target = profile.read_text().strip()
         # Mesh and amplification stages start at shader model 6.5. Linked
         # requests currently repack the outputs of vertex and geometry shaders.
         profiles = r"(vs|gs)_6_[016]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
