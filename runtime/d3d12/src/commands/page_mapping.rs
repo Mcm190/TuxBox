@@ -149,7 +149,7 @@ impl Mappings {
                 )
             };
             for import in overlaps {
-                unsafe {
+                let status = unsafe {
                     validate(
                         batches.len() as u32,
                         batches.as_ptr(),
@@ -158,8 +158,14 @@ impl Mappings {
                         import.start,
                         import.end,
                     )
+                };
+                if status.is_err() {
+                    crate::diagnostics::log(&format!(
+                        "GPU page mapping rejected over live import {:#x}..{:#x}: {:#010x}",
+                        import.start, import.end, status.0,
+                    ));
+                    return Err(status.into());
                 }
-                .ok()?;
             }
         }
         unsafe {

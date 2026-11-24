@@ -268,14 +268,19 @@ unsafe extern "system" fn validate_pinned_page_mappings(
         })
     };
     match plan {
-        Ok(updates)
-            if updates
-                .iter()
-                .any(|entry| entry.at < end && start < entry.at + PAGE) =>
-        {
+        Ok(updates) => {
+            let Some(change) = updates.iter().find(|entry| entry.at < end && start < entry.at + PAGE)
+            else { return 0 };
+            if std::env::var_os("TUXBOX_LOG").is_some_and(|mode| mode == "1") {
+                use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
+                let line = format!(
+                    "TuxBox xmem: pinned page change at {:#x}, old token {:x?}, new token {:x?}\n\0",
+                    change.at, change.old, change.new,
+                );
+                unsafe { OutputDebugStringA(line.as_ptr()) };
+            }
             windows_sys::Win32::Foundation::E_NOTIMPL
         }
-        Ok(_) => 0,
         Err(error) => (0x8007_0000 | (error & 0xffff)) as i32,
     }
 }
