@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The packaged profile reached player selection at 3840×2160 on GeForce and the opening sequence on Radeon. The recorded Radeon Series S runs presented black frames at 1920×1080. [Title progress](PROGRESS.md) · [GeForce run record](../evidence/projectscarlett-startup.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The packaged profile reached player selection at 3840×2160 on GeForce and completed first-run setup on Radeon. The recorded Radeon Series S runs presented black frames at 1920×1080. [Title progress](PROGRESS.md) · [GeForce run record](../evidence/projectscarlett-startup.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -91,7 +91,7 @@ The game records requested shaders in the active prefix, and a worker compiles t
 
 ## What to expect
 
-The game opens its Americas window, loads its archives and presents 3840×2160 frames. The player selection prompt shows Account Picker, Screen Narration and TuxBox. The recorded GeForce run stopped at a title breakpoint 97 seconds after launch. On Radeon, Enter maps to controller A and advanced through the six-star loading screen to the opening sequence. Full playback and gameplay remain unverified. [Current priorities](PROGRESS.md#current-priorities)
+The game opens its Americas window, loads its archives and presents 3840×2160 frames. The player selection prompt shows Account Picker, Screen Narration and TuxBox. The recorded GeForce run stopped at a title breakpoint 97 seconds after launch. On Radeon, Enter maps to controller A and advanced through the opening sequence and first-run setup. Confirming the legal terms led to a black loading screen. Gameplay remains unverified. [Current priorities](PROGRESS.md#current-priorities)
 
 In a new prefix, the game stops at a breakpoint during System Init because it reads its package through the `G:` drive, as on the console, and the launcher doesn't map that drive yet. A fix is in review. [Pull request #6](https://github.com/brcly/TuxBox/pull/6)
 
@@ -117,6 +117,7 @@ These runs used the matching 1.0.2.1 executable, an RX 9070 XT with Mesa RADV 26
 | Series S wait and cache-barrier fixes | The trace identified an enhanced barrier and an RTV clear before the rejected GPU wait. TuxBox submitted the list in order and the wait completed. A separate `E_INVALIDARG` came from Device11 slot 131, which the title calls with cache and engine masks and a VA range at RVA `0x1560994`. The corrected mapping uses the enhanced global cache barrier. |
 | Packaged profile with command-buffer import reuse, `1172b73` | Player selection appeared at about 135 seconds. GameInput recorded X, Y and A. Y initiated an account-selection request. A advanced to the six-star screen. Sampled player-selection frame rates were 1.8 FPS before the cache and 7.4 FPS after it, with different diagnostic settings in the two runs. |
 | Packaged profile with A pressed first | The six-star screen was followed by the opening graphic. A GPU readback measured mean RGB `(133, 117, 53)` at 3840×2160, and the window capture showed the full-colour opening artwork. The run closed cleanly at 173.5 seconds. [Opening screenshot](../evidence/projectscarlett-radeon-opening.webp) |
+| Packaged profile through first-run setup | The opening sequence led into navigation, UI text size, subtitles and brightness settings. The title accepted the default values, displayed the legal notices and terms, and started loading after confirmation. The next sampled display frames were black while shader compilation continued. |
 
 During the initial warm run, the title's slot 86 pipeline stream returned `0x8007007e`. TuxBox's screen-rectangle path loads Windows `dxcompiler.dll` inside the game process. Staging the Windows x64 compiler and validator from DXC v1.8.2505.1 restored that pipeline.
 

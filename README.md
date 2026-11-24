@@ -14,7 +14,7 @@ Many calls an Xbox Series game makes already work through standard Windows APIs.
 - **Lanes** is a small game that uses TuxBox’s Xbox graphics, memory and input libraries. Collect coins and dodge barriers using a keyboard, mouse or Xbox controller.
 - **The Matrix Awakens (Frosty)** reaches the Wake Up chase cinematic on Linux with TuxBox XG and reduced graphics settings. Earlier reduced-settings runs reached the highway chase and open city. With the original Xbox settings it loads the Construct map and presents a black frame before stopping while creating a compute shader during scene setup. You supply the game, its matching Xbox system files and Proton. [Setup and test results](docs/MATRIX_AWAKENS.md)
 
-**GTA VI (ProjectScarlett)** reaches player selection at 3840×2160 on stock Proton Experimental. On a Radeon RX 9070 XT, the packaged profile accepted controller A and rendered the opening sequence after the six-star loading screen. Gameplay remains unverified. [Title progress](docs/PROGRESS.md) · [Setup and Radeon run details](docs/PROJECTSCARLETT.md)
+**GTA VI (ProjectScarlett)** reaches player selection at 3840×2160 on stock Proton Experimental. On a Radeon RX 9070 XT, the packaged profile played the opening sequence, accepted the first-run settings and advanced beyond the legal terms screen. Gameplay remains unverified. [Title progress](docs/PROGRESS.md) · [Setup and Radeon run details](docs/PROJECTSCARLETT.md)
 
 ![ProjectScarlett opening graphic rendered on a Radeon RX 9070 XT under stock Proton Experimental](evidence/projectscarlett-radeon-opening.webp)
 
