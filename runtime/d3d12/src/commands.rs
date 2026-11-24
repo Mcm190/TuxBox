@@ -1212,7 +1212,11 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
     let mut slots = LIST_SLOTS;
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
+    // Device11 exposes these aliases while still using the base reset slot.
+    slots[86] = crate::slot!(copy_resource);
+    slots[129] = crate::slot!(graphics::dispatch_mesh);
     slots[142] = crate::slot!(graphics::sample_mask);
+    slots[148] = crate::slot!(enhanced::barrier);
     slots
 };
 
