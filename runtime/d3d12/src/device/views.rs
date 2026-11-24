@@ -172,6 +172,13 @@ const _: () = assert!(std::mem::offset_of!(AddressSrv, address) == 40);
 
 fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: bool)
     -> windows::core::Result<Option<std::sync::Arc<TextureAddress>>> {
+    buffer_at_with_flags(device, address, bytes, stride, required, D3D12_RESOURCE_FLAG_NONE)
+}
+
+fn buffer_at_with_flags(
+    device: &Device, address: u64, bytes: u64, stride: u32, required: bool,
+    flags: D3D12_RESOURCE_FLAGS,
+) -> windows::core::Result<Option<std::sync::Arc<TextureAddress>>> {
     use windows::Win32::Foundation::E_INVALIDARG;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
@@ -179,6 +186,7 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     if let Some(entry) = device.state.texture_addresses.preceding(address as usize) {
         let host = unsafe { entry.native.GetDesc() };
         if host.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            && host.Flags.contains(flags)
             && entry.offset(address).is_multiple_of(u64::from(stride))
             && entry.offset(address).checked_add(bytes).is_some_and(|end| end <= host.Width) {
             return Ok(Some(entry));
@@ -196,7 +204,7 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     let mut host = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1,
         // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT (Agility SDK 617).
-        Flags: if tight { D3D12_RESOURCE_FLAGS(0x400) } else { D3D12_RESOURCE_FLAG_NONE },
+        Flags: flags | if tight { D3D12_RESOURCE_FLAGS(0x400) } else { D3D12_RESOURCE_FLAG_NONE },
         MipLevels: 1, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
     };
@@ -343,6 +351,73 @@ pub(super) unsafe extern "system" fn address_srv(
     } else {
         unsafe { device.native.CreateShaderResourceView(native, Some(&view), handle) };
     }
+}
+
+#[repr(C)]
+pub(super) struct AddressUav {
+    view: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    address: u64,
+}
+const _: () = assert!(std::mem::offset_of!(AddressUav, address) == 40);
+
+// Device slot 71 (title RVA 0x511f267): the UAV counterpart of address_srv.
+// The title passes a buffer resource description, a UAV description followed
+// by the guest GPU address, and the destination descriptor.
+pub(super) unsafe extern "system" fn address_uav(
+    device: &Device,
+    resource_desc: &D3D12_RESOURCE_DESC,
+    desc: &AddressUav,
+    mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    check_destination(handle);
+    crate::diagnostics::display::texture_view(handle.ptr, None, None);
+    device.state.placements.views.set(handle.ptr, None, false);
+    device.state.blas.views.store(handle.ptr, None);
+    let mut view = desc.view;
+    let null = |view: &D3D12_UNORDERED_ACCESS_VIEW_DESC, why: &str| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&ONCE, || format!(
+            "address UAV at {:#x} written as null ({why}): dim={} width={} format={} view_dim={}",
+            desc.address, resource_desc.Dimension.0, resource_desc.Width, view.Format.0, view.ViewDimension.0));
+        device.state.imported_views.store(handle.ptr, None);
+        let mut view = *view;
+        if view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+            let buffer = unsafe { &mut view.Anonymous.Buffer };
+            buffer.FirstElement = 0;
+            buffer.NumElements = buffer.NumElements.max(1);
+            buffer.CounterOffsetInBytes = 0;
+        }
+        unsafe { device.native.CreateUnorderedAccessView(None, None, Some(&view), handle) };
+    };
+    if desc.address == 0 || resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return null(&view, "not an addressed buffer");
+    }
+    let buffer = unsafe { view.Anonymous.Buffer };
+    let Some(stride) = element_stride(view.Format.0, buffer.StructureByteStride) else {
+        return null(&view, "unsupported format");
+    };
+    if buffer.NumElements == 0 || buffer.CounterOffsetInBytes != 0
+        || buffer.FirstElement.checked_add(u64::from(buffer.NumElements))
+            .is_none_or(|end| end > resource_desc.Width / u64::from(stride))
+    {
+        return null(&view, "invalid buffer view range or counter");
+    }
+    let entry = match buffer_at_with_flags(
+        device, desc.address, resource_desc.Width, stride, true, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    ) {
+        Ok(Some(entry)) => entry,
+        _ => return null(&view, "writable buffer import failed"),
+    };
+    let offset = entry.offset(desc.address);
+    let Some(first) = buffer.FirstElement.checked_add(offset / u64::from(stride)) else {
+        return null(&view, "element offset overflow");
+    };
+    view.Anonymous.Buffer.FirstElement = first;
+    let native = entry.native.clone();
+    device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::Registered { _address: entry }));
+    unsafe { device.native.CreateUnorderedAccessView(&native, None, Some(&view), handle) };
 }
 
 pub(super) unsafe extern "system" fn srv(
