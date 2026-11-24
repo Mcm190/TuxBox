@@ -68,6 +68,16 @@ Inside the namespace the only network device is a loopback interface that is dow
 
 Add `--mangohud` before the package path to record frame times. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/Proton - Experimental`. Pass `--prefix` to use another one.
 
+## Test with an MCP client
+
+Configure a local stdio MCP server to run the command below. Start it from the desktop session with the same Python environment, `PATH` and shader tools as the launcher. The window tools use X11 or XWayland, `xprop`, ImageMagick's `import` and libXtst.
+
+```sh
+python tools/scarlett_mcp.py --package /path/to/scarlett-run --prefix build/scarlett-mcp-prefix
+```
+
+The server uses its own launch session. `launch` starts the game offline with MangoHud. By default it reads back the presented source every 600 frames. Set `trace_interval` to zero for a run without GPU readback. `status` shows the log tail, presentation milestones and recent frame samples. `screenshot` saves the game window and returns it to the client. `press` sends a controller button through the keyboard mapping while the game has focus. `stop` requests window close. Logs and captures go under `build/scarlett-mcp/` by default.
+
 ## Shader preparation
 
 The first launch records each shader the game requests in the prefix. Before later launches, the launcher compiles the recorded requests and shows its progress, so the game reuses those translations instead of compiling them during play. Pass `--prepare-only` to prepare without starting the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the package path. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
