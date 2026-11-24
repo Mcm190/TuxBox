@@ -164,6 +164,36 @@ pub(super) fn unmap(address: usize) -> Result<(), u32> {
     }
 }
 
+/// Replace an isolated placeholder with private anonymous committed pages.
+/// Unlike section views (`MEM_MAPPED`), `MEM_PRIVATE` pages import cleanly
+/// through `OpenExistingHeapFromAddress1` on Linux AMD (RADV/amdgpu userptr).
+pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    let view = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            address as _,
+            bytes,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if view.is_null() {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn unmap_private(address: usize, bytes: usize) -> Result<(), u32> {
+    if unsafe { VirtualFree(address as _, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn region(address: usize) -> Result<MEMORY_BASIC_INFORMATION, u32> {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     if unsafe {

@@ -27,9 +27,9 @@ impl Recording {
         let mut held = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
         for &r in resources {
             let item: ID3D12Pageable = r.clone().into();
-            if !held.contains(&item) {
-                held.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
-                held.push(item);
+            if !held.pageables.contains(&item) {
+                held.pageables.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+                held.pageables.push(item);
             }
         }
         Ok(())

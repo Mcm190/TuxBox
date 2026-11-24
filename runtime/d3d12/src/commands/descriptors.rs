@@ -52,9 +52,9 @@ impl ResourceHeap {
         // SetDescriptorHeaps and command-list Reset can precede GPU execution.
         // The allocator keeps the map, shader-visible heap and its aliases alive.
         for object in [&self.guest, &ID3D12Pageable::from(map)] {
-            if !held.contains(object) {
-                held.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
-                held.push(object.clone());
+            if !held.pageables.contains(object) {
+                held.pageables.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
+                held.pageables.push(object.clone());
             }
         }
         Ok(address)

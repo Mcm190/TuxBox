@@ -1,4 +1,5 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -10,7 +11,7 @@ import stat
 import struct
 import subprocess
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from .inspect import digest
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_container, run_tool
@@ -252,52 +253,79 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
             pass  # Retry and report the error if this game needs a shader.
     refused = cached_refusals = 0
 
+    state_lock = Lock()
+    in_flight = set()
+
     def remember(source, inputs):
         nonlocal archive
-        if archive is not None:
+        with state_lock:
+            target = archive
+        if target is not None:
             try:
-                archive_request(archive, source, inputs)
+                archive_request(target, source, inputs)
             except OSError as exc:
-                report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
-                archive = None
+                with state_lock:
+                    if archive is not None:
+                        report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
+                        archive = None
 
-    while not stop.is_set():
-        directory = session / "requests"
-        requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
-        if not requests:
-            wait()
-            continue
-        for source in requests:
-            if stop.is_set():
-                break
-            key = source.stem
-            if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
-                remove_request(source)
-                continue
-            failed = False
-            try:
-                if tools is None:
-                    tools, cache = bind_cache()
-                if archive is None:
-                    compiled = compile_request(source, key, tools, cache, session)
-                else:
-                    compiled = compile_request(source, key, tools, cache, session, remember=remember)
-                if compiled:
-                    report(f"Compiled Xbox shader {key}")
-            except ShaderRefused as exc:
-                failed = True
+    def handle(source, key):
+        nonlocal tools, cache, refused, cached_refusals
+        failed = False
+        try:
+            with state_lock:
+                local_tools, local_cache = tools, cache
+                has_archive = archive is not None
+            if local_tools is None:
+                with state_lock:
+                    if tools is None:
+                        tools, cache = bind_cache()
+                    local_tools, local_cache = tools, cache
+            if not has_archive:
+                compiled = compile_request(source, key, local_tools, local_cache, session)
+            else:
+                compiled = compile_request(source, key, local_tools, local_cache, session, remember=remember)
+            if compiled:
+                report(f"Compiled Xbox shader {key}")
+        except ShaderRefused as exc:
+            failed = True
+            with state_lock:
                 if exc.cached:
                     cached_refusals += 1
                 else:
                     refused += 1
                     report(f"Xbox shader {key}: {exc}")
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failed = True
-                report(f"Xbox shader {key}: {exc}")
-            finally:
-                remove_request(source)
-                if failed:
-                    (session / (key + ".failed")).touch()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            failed = True
+            report(f"Xbox shader {key}: {exc}")
+        finally:
+            remove_request(source)
+            if failed:
+                (session / (key + ".failed")).touch()
+            with state_lock:
+                in_flight.discard(source)
+
+    workers = min(8, max(1, (os.cpu_count() or 2) // 2))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while not stop.is_set():
+            directory = session / "requests"
+            requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
+            submitted = False
+            for source in requests:
+                if stop.is_set():
+                    break
+                key = source.stem
+                if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
+                    remove_request(source)
+                    continue
+                with state_lock:
+                    if source in in_flight:
+                        continue
+                    in_flight.add(source)
+                pool.submit(handle, source, key)
+                submitted = True
+            if not submitted:
+                wait()
     if refused or cached_refusals:
         report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
 

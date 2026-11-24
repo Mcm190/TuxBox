@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The current result is the player selection prompt at 3840×2160. [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-startup.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The documented GeForce run reached player selection at 3840×2160. The Radeon Series S runs reach 1920×1080 presentation with black frames. [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-startup.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -85,7 +85,7 @@ The `primary_plane_only` diagnostic presents plane zero when the title submits t
 
 ## Shader preparation
 
-The first launch records each shader the game requests in the prefix. Before later launches, the launcher compiles the recorded requests and shows its progress, so the game reuses those translations instead of compiling them during play. Pass `--prepare-only` to prepare without starting the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the package path. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
+The game records requested shaders in the active prefix, and a worker compiles them while it runs. Pass `--prepare-only` before the package path to compile the available requests into the base prefix's cache before launching. Series S mode starts from a temporary copy of that prefix. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
 
 ## What to expect
 
@@ -111,9 +111,11 @@ These runs used the matching 1.0.2.1 executable, an RX 9070 XT with Mesa RADV 26
 | Series S accessibility startup | After TuxBox served `XAccessibility`, the title created a local speech handle and enumerated zero installed voices. Local sign-in returned the user handle. Both display planes stayed black. The Proton runtime fixture verified the caption, contrast, voice enumeration and speech handle calls. [xcl interface slots](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/xgameruntime/gdk_table.rs) · [GDK text-to-speech](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/text-to-speech/text-to-speech) |
 | Series S command ordering | A temporary diagnostic accepted a GPU memory wait after a clear and logged the subsequent render command on the same list. The list closed with `E_NOTIMPL` under the diagnostic. Both sampled display planes stayed black through the clean exit at 161 seconds. |
 | Package splash preview | The dump's `xbs_splash.png` is 1920×1080 and opened in a separate desktop window. Game frame verification still requires visible pixels from the title's display planes. |
+| Historical D3D12 provider on Radeon | Built `d3d12_xs.dll` from `c217aa4`, the revision that reported player selection on GeForce, and used the current launcher and installed Proton build. The packaged profile read back black 3840×2160 frames through the clean exit at 106 seconds. |
+| Series S wait and cache-barrier fixes | The trace identified an enhanced barrier and an RTV clear before the rejected GPU wait. TuxBox submitted the list in order and the wait completed. A separate `E_INVALIDARG` came from Device11 slot 131, which the title calls with cache and engine masks and a VA range at RVA `0x1560994`. The corrected mapping uses the enhanced global cache barrier. |
 
 During the initial warm run, the title's slot 86 pipeline stream returned `0x8007007e`. TuxBox's screen-rectangle path loads Windows `dxcompiler.dll` inside the game process. Staging the Windows x64 compiler and validator from DXC v1.8.2505.1 restored that pipeline.
 
-The Series S startup list records rendering commands on both sides of a GPU memory wait. The current provider supports waits before the native draw and dispatch commands. The effect of the rejected wait on the first visible screen remains unresolved.
+An enhanced barrier and RTV clear can now precede a GPU memory wait while preserving the title's list order. The rejected startup wait went through after this change. The wait fix alone did not restore visible output. The warmed Radeon prefix had 1,726 cached shader translations and 1,411 unsupported requests when checked with `--prepare-only`. The renderer can substitute resource-free shaders for missing compute pipelines, so a successful boot or present does not establish shader coverage.
 
 VIctory reports working first-boot menus and intro video on its Windows backend. An xcl report for this package reached first-run setup and later hit a title fault. Both projects select the primary display plane on the host. In TuxBox, 35 shader programs that reported sampler errors without a root signature also had requests with their pipeline root attached. The rooted variants progressed past that sampler error, with several then refused on divergent wave reductions. [VIctory status](https://github.com/Marvisak/VIctory) · [VIctory presentation](https://github.com/Marvisak/VIctory/blob/main/crates/victory-gpu/src/queue.rs) · [xcl first-run report](https://github.com/ivall/xcl/issues/846) · [xcl presentation](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/d3d12x/present.rs)

@@ -17,6 +17,9 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 const PAGE: usize = shared_pages::PAGE;
+// Split single-alias MEM_PRIVATE placeholder mappings into 4 MiB chunks so
+// promoting a page to a shared section on alias never copies a multi-GiB pool.
+const PRIVATE_CHUNK_PAGES: usize = 64;
 const FLAGS: u64 = 0x2040_0000;
 mod copy_mappings;
 
@@ -24,6 +27,7 @@ struct Page {
     section: Arc<Section>,
     offset: u64,
     aliases: usize,
+    private_addr: Option<usize>,
     has_section_data: bool,
     mapped: bool,
     saved: Vec<u8>,
@@ -37,6 +41,8 @@ struct Pool {
     gpu_aliases: HashSet<usize>,
     // Contiguous token batches share one OS view until a partial unmap.
     views: BTreeMap<usize, usize>,
+    // Subset of `views` backed by MEM_PRIVATE (promoted to Section if aliased).
+    private_views: BTreeMap<usize, usize>,
     // Only split apertures with live views are retained. An empty original
     // reservation is coalesced and may be released directly by the guest.
     apertures: BTreeMap<usize, (usize, usize)>,
@@ -124,6 +130,7 @@ impl Pool {
                 Page {
                     mapped: false,
                     aliases: 0,
+                    private_addr: None,
                     saved: Vec::new(),
                     offset: (token - first) * PAGE as u64,
                     section: Arc::clone(&section),
@@ -156,6 +163,43 @@ impl Pool {
         (address - base < bytes).then_some((base, bytes))
     }
 
+    fn promote_private_view(&mut self, lo: usize) -> Result<(), u32> {
+        let Some(&hi) = self.private_views.get(&lo) else { return Ok(()); };
+        let bytes = hi - lo;
+        let first_token = self.mappings[&lo];
+        let section = self.pages[&first_token].section.clone();
+        let offset = self.pages[&first_token].offset;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(bytes).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        buf.resize(bytes, 0);
+        unsafe { ptr::copy_nonoverlapping(lo as *const u8, buf.as_mut_ptr(), bytes); }
+        shared_pages::unmap_private(lo, bytes)?;
+        if let Err(e) = section.map_range(offset, lo, bytes) {
+            let _ = shared_pages::map_private_range(lo, bytes);
+            unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), lo as *mut u8, bytes); }
+            return Err(e);
+        }
+        unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), lo as *mut u8, bytes); }
+        self.private_views.remove(&lo);
+        for a in (lo..hi).step_by(PAGE) {
+            let t = self.mappings[&a];
+            let p = self.pages.get_mut(&t).unwrap();
+            p.private_addr = None;
+            p.has_section_data = true;
+        }
+        Ok(())
+    }
+
+    fn ensure_section_backed(&mut self, token: u64) -> Result<(), u32> {
+        let Some(old_at) = self.pages.get(&token).and_then(|p| p.private_addr) else {
+            return Ok(());
+        };
+        if let Some((&lo, &hi)) = self.private_views.range(..=old_at).next_back() && old_at < hi {
+            self.promote_private_view(lo)?;
+        }
+        Ok(())
+    }
+
     // Try the placeholder operations themselves. This avoids keeping records
     // for empty apertures which games can release with plain VirtualFree.
     fn map_shared_page(&mut self, at: usize, token: u64) -> Result<bool, u32> {
@@ -174,10 +218,18 @@ impl Pool {
             info.AllocationBase.addr(),
             info.BaseAddress.addr() + info.RegionSize - info.AllocationBase.addr(),
         ));
-        let page = self.pages.get_mut(&token).ok_or(ERROR_INVALID_PARAMETER)?;
-        if page.mapped {
+        let mapped = self.pages.get(&token).ok_or(ERROR_INVALID_PARAMETER)?.mapped;
+        // Single-page / scatter mappings (e.g. XMemMapPhysicalPagesScatter) are
+        // routinely aliased later; keep them section-backed so promoting them
+        // never replaces a VMA pinned by an active AMDGPU userptr BO.
+        let use_private = false;
+        if mapped {
             return Err(ERROR_BUSY);
         }
+        if !use_private {
+            self.ensure_section_backed(token)?;
+        }
+        let info = shared_pages::region(at)?;
         if let Err(e) = shared_pages::isolate_page(at, &info) {
             return if existing.is_some() {
                 Err(e)
@@ -185,6 +237,31 @@ impl Pool {
                 Ok(false)
             };
         }
+        if use_private {
+            if let Err(e) = shared_pages::map_private_range(at, PAGE) {
+                if existing.is_some() {
+                    return Err(e);
+                }
+                if extent == PAGE {
+                    return Ok(false);
+                }
+                shared_pages::coalesce(base, extent)?;
+                return Err(e);
+            }
+            let page = self.pages.get_mut(&token).unwrap();
+            if !page.saved.is_empty() {
+                unsafe { ptr::copy_nonoverlapping(page.saved.as_ptr(), at as *mut u8, PAGE); }
+                page.saved = Vec::new();
+            }
+            page.private_addr = Some(at);
+            page.aliases += 1;
+            self.views.insert(at, at + PAGE);
+            self.private_views.insert(at, at + PAGE);
+            self.mappings.insert(at, token);
+            self.apertures.entry(base).or_insert((extent, 0)).1 += 1;
+            return Ok(true);
+        }
+        let page = self.pages.get_mut(&token).ok_or(ERROR_INVALID_PARAMETER)?;
         if let Err(e) = page.section.map(page.offset, at) {
             if existing.is_some() {
                 return Err(e);
@@ -224,8 +301,60 @@ impl Pool {
         let info = shared_pages::region(start)?;
         if info.State != MEM_RESERVE || info.AllocationProtect != windows_sys::Win32::System::Memory::PAGE_NOACCESS
             || start + bytes > info.BaseAddress.addr() + info.RegionSize { return Ok(false); }
+        let existing = self.aperture(start);
         let base = info.AllocationBase.addr();
-        let (base, extent) = self.aperture(start).unwrap_or((base, info.BaseAddress.addr() + info.RegionSize - base));
+        let (base, extent) = existing.unwrap_or((base, info.BaseAddress.addr() + info.RegionSize - base));
+        // Huge reservations (> 512 MiB, e.g., the registered GPU page pool) are
+        // aliased via CopyPageMappingsBatchX; keep them section-backed so a live
+        // AMDGPU userptr BO is never invalidated by promoting a neighboring page.
+        let all_private = tokens.len() <= 8192
+            && tokens.iter().all(|t| {
+                let p = &self.pages[t];
+                p.aliases == 0 && !p.has_section_data
+            });
+        if all_private {
+            let mut mapped_chunks: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < tokens.len() {
+                let count = (tokens.len() - cursor).min(PRIVATE_CHUNK_PAGES);
+                let chunk_start = start + cursor * PAGE;
+                let chunk_bytes = count * PAGE;
+                let cinfo = shared_pages::region(chunk_start)?;
+                let step = shared_pages::isolate_range(chunk_start, chunk_bytes, &cinfo)
+                    .and_then(|()| shared_pages::map_private_range(chunk_start, chunk_bytes));
+                if let Err(e) = step {
+                    for &(ca, cb) in mapped_chunks.iter().rev() {
+                        let _ = shared_pages::unmap_private(ca, cb - ca);
+                    }
+                    if mapped_chunks.is_empty() && existing.is_none() && start == base && bytes == extent {
+                        return Ok(false);
+                    }
+                    if existing.is_none() {
+                        let _ = shared_pages::coalesce(base, extent);
+                    }
+                    return if mapped_chunks.is_empty() && existing.is_none() { Ok(false) } else { Err(e) };
+                }
+                mapped_chunks.push((chunk_start, chunk_start + chunk_bytes));
+                cursor += count;
+            }
+            for &(ca, cb) in &mapped_chunks {
+                self.views.insert(ca, cb);
+                self.private_views.insert(ca, cb);
+            }
+            self.apertures.entry(base).or_insert((extent, 0)).1 += tokens.len();
+            for (i, &token) in tokens.iter().enumerate() {
+                let at = start + i * PAGE;
+                let p = self.pages.get_mut(&token).unwrap();
+                p.aliases += 1;
+                p.private_addr = Some(at);
+                self.mappings.insert(at, token);
+            }
+            return Ok(true);
+        }
+        for &token in tokens {
+            self.ensure_section_backed(token)?;
+        }
+        let info = shared_pages::region(start)?;
         if shared_pages::isolate_range(start, bytes, &info).is_err() { return Ok(false); }
         if let Err(e) = section.map_range(offset, start, bytes) {
             // A plain PAGE_NOACCESS reserve cannot be replaced by a section.
@@ -244,13 +373,80 @@ impl Pool {
         Ok(true)
     }
 
-    // Restore section-backed fragments around an unmapped interval. Guest
-    // aliases retain their original bytes and file offsets on both sides.
-    fn unmap_view_range(&mut self, at: usize, bytes: usize) -> Result<bool, u32> {
+    // Restore section-backed or private fragments around an unmapped interval.
+    fn unmap_view_range(&mut self, at: usize, bytes: usize, preserve: bool) -> Result<bool, u32> {
         let Some((&lo, &hi)) = self.views.range(..=at).next_back() else { return Ok(false); };
         let end = at + bytes;
         if at >= hi || end > hi { return Ok(false); }
         let (base, extent) = self.aperture(at).ok_or(ERROR_INVALID_ADDRESS)?;
+        if self.private_views.contains_key(&lo) {
+            if preserve {
+                for a in (at..end).step_by(PAGE) {
+                    let t = self.mappings[&a];
+                    let p = self.pages.get_mut(&t).unwrap();
+                    if p.saved.is_empty() {
+                        p.saved.try_reserve_exact(PAGE).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+                        p.saved.resize(PAGE, 0);
+                    }
+                    unsafe { ptr::copy_nonoverlapping(a as *const u8, p.saved.as_mut_ptr(), PAGE); }
+                }
+            }
+            let mut left = Vec::new();
+            if lo < at {
+                left.try_reserve_exact(at - lo).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+                left.resize(at - lo, 0);
+                unsafe { ptr::copy_nonoverlapping(lo as *const u8, left.as_mut_ptr(), at - lo); }
+            }
+            let mut right = Vec::new();
+            if end < hi {
+                right.try_reserve_exact(hi - end).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+                right.resize(hi - end, 0);
+                unsafe { ptr::copy_nonoverlapping(end as *const u8, right.as_mut_ptr(), hi - end); }
+            }
+            shared_pages::unmap_private(lo, hi - lo)?;
+            let mut restored = Vec::new();
+            let resize = (|| {
+                for (a, b, data) in [(lo, at, &left), (end, hi, &right)] {
+                    if a == b { continue; }
+                    shared_pages::isolate_range(a, b - a, &shared_pages::region(a)?)?;
+                    shared_pages::map_private_range(a, b - a)?;
+                    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), a as *mut u8, b - a); }
+                    restored.push((a, b));
+                }
+                if self.apertures[&base].1 == bytes / PAGE {
+                    shared_pages::coalesce(base, extent)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = resize {
+                for &(a, b) in &restored { let _ = shared_pages::unmap_private(a, b - a); }
+                let _ = shared_pages::coalesce(lo, hi - lo);
+                let _ = shared_pages::map_private_range(lo, hi - lo);
+                if !left.is_empty() {
+                    unsafe { ptr::copy_nonoverlapping(left.as_ptr(), lo as *mut u8, left.len()); }
+                }
+                if !right.is_empty() {
+                    unsafe { ptr::copy_nonoverlapping(right.as_ptr(), end as *mut u8, right.len()); }
+                }
+                return Err(e);
+            }
+            self.views.remove(&lo);
+            self.private_views.remove(&lo);
+            for &(a, b) in &restored {
+                self.views.insert(a, b);
+                self.private_views.insert(a, b);
+            }
+            for a in (at..end).step_by(PAGE) {
+                let t = self.mappings.remove(&a).unwrap();
+                let p = self.pages.get_mut(&t).unwrap();
+                p.aliases -= 1;
+                p.private_addr = None;
+            }
+            let live = &mut self.apertures.get_mut(&base).unwrap().1;
+            *live -= bytes / PAGE;
+            if *live == 0 { self.apertures.remove(&base); }
+            return Ok(true);
+        }
         let first = &self.pages[&self.mappings[&lo]];
         let section = first.section.clone();
         let offset = first.offset;
@@ -287,7 +483,7 @@ impl Pool {
     }
 
     fn unmap_shared_page(&mut self, at: usize) -> Result<(), u32> {
-        if self.unmap_view_range(at, PAGE)? { return Ok(()); }
+        if self.unmap_view_range(at, PAGE, true)? { return Ok(()); }
         let (base, extent) = self.aperture(at).ok_or(ERROR_INVALID_ADDRESS)?;
         let token = *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?;
         shared_pages::unmap(at)?;
@@ -394,7 +590,7 @@ impl Pool {
     }
 
     fn unmap(&mut self, address: usize, bytes: usize) -> Result<(), u32> {
-        if self.unmap_view_range(address, bytes)? { return Ok(()); }
+        if self.unmap_view_range(address, bytes, true)? { return Ok(()); }
         if let Some((base, extent)) = self.aperture(address) {
             if address + bytes > base + extent {
                 return Err(ERROR_INVALID_ADDRESS);
@@ -406,13 +602,28 @@ impl Pool {
             for at in (address..address + bytes).step_by(PAGE) {
                 entries.push((at, *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?));
             }
-            for (i, &(at, _)) in entries.iter().enumerate() {
-                if let Err(e) = self.unmap_shared_page(at) {
-                    for &(prior, token) in entries[..i].iter().rev() {
+            let mut idx = 0;
+            while idx < entries.len() {
+                let start = entries[idx].0;
+                let mut next = idx + 1;
+                let res = if let Some((_, &limit)) = self.views.range(..=start).next_back()
+                    && start < limit
+                {
+                    while next < entries.len() && entries[next].0 < limit {
+                        next += 1;
+                    }
+                    self.unmap_view_range(start, (next - idx) * PAGE, true)
+                        .and_then(|done| if done { Ok(()) } else { Err(ERROR_INVALID_ADDRESS) })
+                } else {
+                    self.unmap_shared_page(start)
+                };
+                if let Err(e) = res {
+                    for &(prior, token) in entries[..idx].iter().rev() {
                         self.map_shared_page(prior, token)?;
                     }
                     return Err(e);
                 }
+                idx = next;
             }
             return Ok(());
         }
@@ -561,7 +772,7 @@ pub unsafe extern "system" fn free(count: usize, tokens: *const u64) -> i32 {
                     && mapped[last].0 == mapped[last - 1].0 + PAGE {
                     last += 1;
                 }
-                pool.unmap_view_range(start, (last - first) * PAGE)
+                pool.unmap_view_range(start, (last - first) * PAGE, false)
                     .and_then(|done| if done { Ok(()) } else { Err(ERROR_INVALID_ADDRESS) })
             } else {
                 pool.unmap_shared_page(start)

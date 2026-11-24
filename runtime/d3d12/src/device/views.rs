@@ -179,19 +179,46 @@ fn buffer_at_with_flags(
     device: &Device, address: u64, bytes: u64, stride: u32, required: bool,
     flags: D3D12_RESOURCE_FLAGS,
 ) -> windows::core::Result<Option<std::sync::Arc<TextureAddress>>> {
+    crate::commands::page_mapping::GPU_APERTURE.wait(address,bytes)?;
+    if let Some(entry) = registered_buffer(device, address, bytes, stride, flags) {
+        return Ok(Some(entry));
+    }
+    let entry = import_address_buffer(device, address, bytes, stride, required, flags)?;
+    Ok(entry.map(|buffer| TextureAddress::at(device, &buffer.native, buffer.base as usize, false, None)))
+}
+
+fn registered_buffer(
+    device: &Device, address: u64, bytes: u64, stride: u32, flags: D3D12_RESOURCE_FLAGS,
+) -> Option<std::sync::Arc<TextureAddress>> {
+    device.state.texture_addresses.preceding(address as usize).filter(|entry| {
+        let host = unsafe { entry.native.GetDesc() };
+        host.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            && host.Flags.contains(flags)
+            && entry.offset(address).is_multiple_of(u64::from(stride))
+            && entry.offset(address).checked_add(bytes).is_some_and(|end| end <= host.Width)
+    })
+}
+
+pub(super) struct CommandBuffer {
+    base: u64,
+    width: u64,
+    native: ID3D12Resource,
+}
+
+impl CommandBuffer {
+    fn resolve(&self, address: u64) -> (Option<ID3D12Resource>, u64) {
+        let gpu = unsafe { self.native.GetGPUVirtualAddress() } + (address - self.base);
+        (Some(self.native.clone()), gpu)
+    }
+}
+
+fn import_address_buffer(
+    device: &Device, address: u64, bytes: u64, stride: u32, required: bool,
+    flags: D3D12_RESOURCE_FLAGS,
+) -> windows::core::Result<Option<CommandBuffer>> {
     use windows::Win32::Foundation::E_INVALIDARG;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
-    crate::commands::page_mapping::GPU_APERTURE.wait(address,bytes)?;
-    if let Some(entry) = device.state.texture_addresses.preceding(address as usize) {
-        let host = unsafe { entry.native.GetDesc() };
-        if host.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-            && host.Flags.contains(flags)
-            && entry.offset(address).is_multiple_of(u64::from(stride))
-            && entry.offset(address).checked_add(bytes).is_some_and(|end| end <= host.Width) {
-            return Ok(Some(entry));
-        }
-    }
     // FirstElement is measured in whole records. If the guest's suballocation
     // starts between records relative to a 64 KiB page, place the buffer at
     // the guest byte offset using the adapter's tight buffer alignment.
@@ -221,14 +248,55 @@ fn buffer_at_with_flags(
     host.Width = bytes.checked_add(address - page).ok_or(E_INVALIDARG)?;
     if !tight { host.Width = host.Width.checked_next_multiple_of(65536).ok_or(E_INVALIDARG)?; }
     let native = super::heap::import_buffer(device, page, &host, D3D12_RESOURCE_STATE_COMMON)?;
-    Ok(Some(TextureAddress::at(device, &native, page as usize, false, None)))
+    Ok(Some(CommandBuffer { base: page, width: host.Width, native }))
 }
 
-pub(crate) unsafe fn command_buffer_address(device: *mut c_void, address: u64, bytes: u64) -> windows::core::Result<(Option<ID3D12Resource>, u64)> {
+pub(crate) unsafe fn command_buffer_address(
+    device: *mut c_void, address: u64, bytes: u64, allocator: Option<&super::MediaResources>,
+) -> windows::core::Result<(Option<ID3D12Resource>, u64)> {
+    use windows::Win32::Foundation::E_OUTOFMEMORY;
+
     let device = unsafe { &*device.cast::<Device>() };
-    let Some(buffer) = buffer_at(device, address, bytes, 1, false)? else { return Ok((None, address)) };
-    let host = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
-    Ok((Some(buffer.native.clone()), host))
+    let flags = D3D12_RESOURCE_FLAG_NONE;
+    crate::commands::page_mapping::GPU_APERTURE.wait(address, bytes)?;
+    if let Some(buffer) = registered_buffer(device, address, bytes, 1, flags) {
+        if let Some(allocator) = allocator {
+            let mut retained = allocator.lock().unwrap_or_else(|e| e.into_inner());
+            retained.pageables.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+            retained.pageables.push(buffer.native.clone().into());
+        }
+        let gpu = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
+        return Ok((Some(buffer.native.clone()), gpu));
+    }
+
+    let import = || import_address_buffer(device, address, bytes, 1, false, flags);
+    let Some(allocator) = allocator else {
+        return Ok(import()?.map_or((None, address), |buffer| buffer.resolve(address)));
+    };
+    let mut retained = allocator.lock().unwrap_or_else(|e| e.into_inner());
+    let index = retained.buffers.partition_point(|buffer| buffer.base <= address);
+    if let Some(i) = index.checked_sub(1) {
+        let buffer = &retained.buffers[i];
+        if (address - buffer.base).checked_add(bytes).is_some_and(|end| end <= buffer.width) {
+            return Ok(buffer.resolve(address));
+        }
+    }
+    let Some(buffer) = import()? else { return Ok((None, address)); };
+    let resolved = buffer.resolve(address);
+    match retained.buffers.binary_search_by_key(&buffer.base, |entry| entry.base) {
+        Ok(i) => {
+            // Previously recorded commands still reference the smaller import.
+            retained.pageables.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+            let previous = std::mem::replace(&mut retained.buffers[i], buffer);
+            retained.pageables.push(previous.native.into());
+        }
+        Err(i) => {
+            // The allocator retains the import until its native reset succeeds.
+            retained.buffers.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+            retained.buffers.insert(i, buffer);
+        }
+    }
+    Ok(resolved)
 }
 
 fn buffer_stride(view: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<u32> {

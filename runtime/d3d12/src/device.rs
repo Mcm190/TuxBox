@@ -156,7 +156,13 @@ unsafe fn wrap_pageable<N: Interface, S>(
     }
 }
 
-pub(crate) type MediaResources = std::sync::Arc<std::sync::Mutex<Vec<ID3D12Pageable>>>;
+#[derive(Default)]
+pub(crate) struct RetainedResources {
+    pub(crate) pageables: Vec<ID3D12Pageable>,
+    buffers: Vec<views::CommandBuffer>,
+}
+
+pub(crate) type MediaResources = std::sync::Arc<std::sync::Mutex<RetainedResources>>;
 pub(crate) type Allocator = Proxy<ID3D12CommandAllocator, MediaResources>;
 
 unsafe extern "system" fn reset_allocator(this: &Allocator) -> HRESULT {
@@ -164,7 +170,8 @@ unsafe extern "system" fn reset_allocator(this: &Allocator) -> HRESULT {
     let mut sources = this.state.lock().unwrap_or_else(|e| e.into_inner());
     let status = unsafe { (host.vtable().Reset)(host.as_raw()) };
     if status.is_ok() {
-        sources.clear();
+        sources.pageables.clear();
+        sources.buffers.clear();
     }
     status
 }

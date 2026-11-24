@@ -114,9 +114,9 @@ pub(super) fn retain(recording: &Recording, resources: &[&ID3D12Resource]) -> Re
         .resources
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    held.try_reserve(resources.len())
+    held.pageables.try_reserve(resources.len())
         .map_err(|_| E_OUTOFMEMORY)?;
-    held.extend(resources.iter().map(|r| ID3D12Pageable::from((*r).clone())));
+    held.pageables.extend(resources.iter().map(|r| ID3D12Pageable::from((*r).clone())));
     Ok(())
 }
 

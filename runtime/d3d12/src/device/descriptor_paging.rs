@@ -337,7 +337,21 @@ impl Arena {
                 if let Some(source) = self.resolve_inline(record) {
                     self.copy_native_view(destination, source);
                     materialized += usize::from(record.source != cell || INLINE_BYTES != self.stride);
-                } else if record == InlineDescriptor::default() {
+                } else {
+                    if record != InlineDescriptor::default() {
+                        // Transient guest descriptor rings can hold stale or
+                        // title-authored bytes in slots the shader never reads.
+                        // Rejecting the whole list drops the frame, so bind a
+                        // null view and keep recording.
+                        static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+                        let seen = UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                        if seen.is_power_of_two() || seen == 0 || crate::diagnostics::display::trace_views() && seen < 16 {
+                            crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+                                "unresolved inline descriptor at {cell:#x}, record {:#x} {:#x} {:#x} {:#x} (table entry {index}/{length}); bound a null view ({} so far)",
+                                record.source, record.version, record.reserved[0], record.reserved[1], seen + 1,
+                            ));
+                        }
+                    }
                     // Inactive slots have no resource. Use a valid null SRV
                     // rather than copying an uninitialized host descriptor.
                     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -352,14 +366,6 @@ impl Arena {
                     self.scenes.copy_to(self.stride, destination.ptr, 0, 1);
                     crate::diagnostics::display::texture_view(destination.ptr, None, None);
                     unsafe { self.device.CreateShaderResourceView(None, Some(&null), destination) };
-                } else {
-                    if crate::diagnostics::display::trace_views() {
-                        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
-                            "unresolved inline descriptor at {cell:#x}, source {:#x}, version {} (table entry {index}/{length})",
-                            record.source, record.version,
-                        ));
-                    }
-                    return Err(E_INVALIDARG.into());
                 }
                 tables.resident_records.insert(slot, record);
             }

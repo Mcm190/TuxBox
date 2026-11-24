@@ -135,12 +135,8 @@ pub(super) fn buffer_offset(resource: &device::Resource, offset: u64, bytes: u64
 
 pub(super) fn address(list: &List, state: &mut super::Recording, guest: u64, bytes: u64) -> Option<u64> {
     if guest == 0 { return Some(0); }
-    let result = unsafe { device::command_buffer_address(parent(&list.parent), guest, bytes.max(1)) }
-        .and_then(|(buffer, va)| {
-            if let Some(buffer) = buffer { super::raytracing::retain(state, &[&buffer])?; }
-            Ok(va)
-        });
-    match result { Ok(va) => Some(va), Err(e) => { state.error = e.code(); None } }
+    let result = unsafe { device::command_buffer_address(parent(&list.parent), guest, bytes.max(1), Some(&state.resources)) };
+    match result { Ok((_, va)) => Some(va), Err(e) => { state.error = e.code(); None } }
 }
 
 pub(super) unsafe extern "system" fn copy_buffer(

@@ -436,11 +436,16 @@ unsafe extern "system" fn close(list: &List) -> HRESULT {
         }
     }
     state.phase = ListState::Closed;
-    if state.error.is_err() && crate::diagnostics::display::trace_views() {
-        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
-            "graphics command list Close rejected {:#010x} (list {list:p}, guest caller {:#x})",
-            state.error.0, crate::survey::title_rva().unwrap_or(0),
-        ));
+    if state.error.is_err() {
+        // A rejected list drops a whole frame of work; always report a sample.
+        static REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seen = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen.is_power_of_two() || crate::diagnostics::display::trace_views() {
+            crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+                "graphics command list Close rejected {:#010x} (list {list:p}, guest caller {:#x}, {seen} so far)",
+                state.error.0, crate::survey::title_rva().unwrap_or(0),
+            ));
+        }
     }
     state.error
 }
@@ -758,7 +763,7 @@ unsafe extern "system" fn flush_texture_cache(list: &List, mask: u32, address: u
 // The extended list accepts separate cache/engine masks before the VA range.
 // A host global barrier covers the full range and every participating stage.
 unsafe extern "system" fn extended_cache_barrier(
-    list: &List, _cache: u32, _engines: u32, address: u64, bytes: u64,
+    list: &List, cache: u32, engines: u32, address: u64, bytes: u64,
 ) {
     let mut state = recording(list);
     if !state.can_record(&list.native) {
@@ -768,6 +773,10 @@ unsafe extern "system" fn extended_cache_barrier(
         state.error = E_INVALIDARG;
         return;
     }
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || format!(
+        "recorded extended cache barrier cache={cache:#x} engines={engines:#x} address={address:#x} bytes={bytes:#x}"
+    ));
     global_cache_barrier(list, &mut state);
 }
 
@@ -806,7 +815,7 @@ unsafe extern "system" fn clear_rtv(
     rects: *const RECT,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.ensure_open(&list.native) {
         return;
     }
     if handle.ptr == 0 || color.is_null() || (count != 0 && rects.is_null()) {
@@ -820,15 +829,18 @@ unsafe extern "system" fn clear_rtv(
         state.error = error;
         return;
     }
-    unsafe {
-        (list.native.vtable().ClearRenderTargetView)(
-            list.native.as_raw(),
-            handle,
-            color,
-            count,
-            rects,
-        )
-    };
+    if state.prefix.accepts_packets() {
+        let regions = if count == 0 { &[] } else { unsafe { slice::from_raw_parts(rects, count as usize) } };
+        let packet = memory_wait::Packet::capture_clear(&list.native, handle, unsafe { *color.cast::<[f32; 4]>() }, regions);
+        if let Err(error) = packet.and_then(|packet| state.prefix.push(&list.native, packet)) {
+            state.error = error.code();
+            return;
+        }
+    } else {
+        unsafe {
+            (list.native.vtable().ClearRenderTargetView)(list.native.as_raw(), handle, color, count, rects)
+        };
+    }
     static FIRST: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&FIRST, || format!(
         "recorded render target clear list={list:p} rtv={:#x} rgba={:?}", handle.ptr, unsafe { &*color.cast::<[f32;4]>() }
@@ -1101,9 +1113,8 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
         return;
     }
     let result = (|| -> windows::core::Result<()> {
-        let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, u64::from(bytes))? };
+        let (_, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, u64::from(bytes), Some(&state.resources))? };
         if dest.checked_add(u64::from(bytes)).is_none() { return Err(E_INVALIDARG.into()); }
-        if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
         let words = unsafe { core::slice::from_raw_parts(source, bytes as usize) };
         let mut writes = Vec::new();
         writes.try_reserve_exact(words.len() / 4).map_err(|_| windows::core::Error::from(E_OUTOFMEMORY))?;
@@ -1124,8 +1135,7 @@ unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, fl
         return;
     }
     let result = (|| -> windows::core::Result<()> {
-        let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, 4)? };
-        if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
+        let (_, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, 4, Some(&state.resources))? };
         let write = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: dest, Value: value };
         state.prefix.push(&list.native, memory_wait::Packet::Marker(write))
     })();
@@ -1215,6 +1225,8 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
     // Device11 exposes these aliases while still using the base reset slot.
     slots[86] = crate::slot!(copy_resource);
     slots[129] = crate::slot!(graphics::dispatch_mesh);
+    // Scarlett RVA 0x1560994 uses slot 131 for a cache barrier on a Device11 list.
+    slots[131] = crate::slot!(extended_cache_barrier);
     slots[142] = crate::slot!(graphics::sample_mask);
     slots[148] = crate::slot!(enhanced::barrier);
     slots
@@ -1222,7 +1234,6 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
 
 static EXTENDED_LIST_SLOTS: Slots<149> = {
     let mut slots = DEVICE11_LIST_SLOTS;
-    slots[131] = crate::slot!(extended_cache_barrier);
     slots[132] = crate::slot!(extended_cache_barrier);
     slots
 };

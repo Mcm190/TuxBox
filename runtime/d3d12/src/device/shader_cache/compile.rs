@@ -147,6 +147,7 @@ fn request(
     let pending = dir.join(format!("{key}.{}.tmp", std::process::id()));
     if let Some(cache) = compiler_cache(dir) {
         if let Some(bytes) = cached_translation(cache, key, stage) {
+            crate::present::hud::shader_cached();
             // Later PSOs in this session can use the verified reply directly.
             if fs::write(&pending, &bytes)
                 .and_then(|()| fs::rename(&pending, &result))
@@ -167,12 +168,15 @@ fn request(
     {
         return None;
     }
+    let guard = crate::present::hud::CompileGuard::start();
     let start = Instant::now();
     loop {
         if let Some(bytes) = read_portable_file(&result, stage) {
+            guard.finish(true);
             return Some(bytes);
         }
         if failed.exists() || start.elapsed() >= Duration::from_secs(90) {
+            guard.finish(false);
             return None;
         }
         std::thread::sleep(Duration::from_millis(25));

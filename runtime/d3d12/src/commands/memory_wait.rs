@@ -1,6 +1,6 @@
 //! Translate waits on host-visible Series fence words at a native list boundary.
-//! The game can write markers and sample timestamps before waiting. Keep these
-//! prefix operations ordered without disturbing bindings on the main command list.
+//! Buffer writes, timestamps, barriers and RTV clears may precede a wait.
+//! These operations can run on a separate list without moving graphics state.
 use super::*;
 use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::mpsc;
@@ -12,9 +12,36 @@ pub(super) enum Packet {
     Marker(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER),
     Writes(Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER>),
     Timestamp(ID3D12QueryHeap, u32, ID3D12Resource, u64),
+    Barriers(enhanced::Batch),
+    Clear(ID3D12DescriptorHeap, [f32; 4], Vec<RECT>),
 }
 
 impl Packet {
+    pub(super) fn capture_clear(
+        list: &ID3D12GraphicsCommandList,
+        handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+        color: [f32; 4],
+        rects: &[RECT],
+    ) -> Result<Self> {
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { list.GetDevice(&mut device)? };
+        let device = device.ok_or(E_FAIL)?;
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: 1,
+            ..Default::default()
+        };
+        let heap: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&desc)? };
+        let mut regions = Vec::new();
+        regions.try_reserve_exact(rects.len()).map_err(|_| E_OUTOFMEMORY)?;
+        regions.extend_from_slice(rects);
+        // Guest CPU descriptors can be overwritten immediately after a clear.
+        unsafe {
+            device.CopyDescriptorsSimple(1, heap.GetCPUDescriptorHandleForHeapStart(), handle, desc.Type);
+        }
+        Ok(Self::Clear(heap, color, regions))
+    }
+
     fn emit(&self, list: &ID3D12GraphicsCommandList) -> Result<()> {
         unsafe {
             match self {
@@ -37,6 +64,11 @@ impl Packet {
                         *offset,
                     );
                 }
+                Self::Barriers(batch) => batch.emit(list)?,
+                Self::Clear(heap, color, rects) => {
+                    let handle = heap.GetCPUDescriptorHandleForHeapStart();
+                    list.ClearRenderTargetView(handle, color, (!rects.is_empty()).then_some(rects));
+                }
             }
         }
         Ok(())
@@ -51,6 +83,10 @@ pub(super) struct Prefix {
 }
 
 impl Prefix {
+    pub(super) fn accepts_packets(&self) -> bool {
+        !self.in_body
+    }
+
     pub(super) fn push(&mut self, list: &ID3D12GraphicsCommandList, packet: Packet) -> Result<()> {
         if self.in_body {
             return packet.emit(list);
@@ -89,7 +125,7 @@ impl Word {
             return Err(E_INVALIDARG.into());
         }
         let (buffer, gpu) =
-            unsafe { device::command_buffer_address(parent(&list.parent), address, 8)? };
+            unsafe { device::command_buffer_address(parent(&list.parent), address, 8, None)? };
         let resource = buffer.ok_or(E_NOTIMPL)?;
         let offset = gpu
             .checked_sub(unsafe { resource.GetGPUVirtualAddress() })
@@ -147,6 +183,13 @@ pub(super) unsafe extern "system" fn wait_value64(
                 "GPU memory wait after rendering commands"
             ));
             return Err(E_NOTIMPL.into());
+        }
+        if state.prefix.pending.iter().any(|packet| matches!(packet, Packet::Barriers(_) | Packet::Clear(..))) {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FIRST, || format!(
+                "recorded GPU wait after render setup target={target:#x} guest caller={:#x}",
+                crate::survey::title_rva().unwrap_or(0)
+            ));
         }
         state
             .prefix

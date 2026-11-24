@@ -71,10 +71,9 @@ pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg
     if !state.ensure_open(&list.native) { return; }
     let result = (|| -> windows::core::Result<()> {
         if arg != 0 || flags != 0 || mode != 1 || address == 0 || !address.is_multiple_of(8) { return Err(E_INVALIDARG.into()); }
-        let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
+        let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8, Some(&state.resources))? };
         let resource = resource.ok_or(E_INVALIDARG)?;
         let offset = gpu.checked_sub(unsafe { resource.GetGPUVirtualAddress() }).ok_or(E_INVALIDARG)?;
-        super::raytracing::retain(&state, &[&resource])?;
         if state.timestamp_page.as_ref().is_none_or(|(_, next)| *next >= SLOTS) {
             let mut device: Option<ID3D12Device> = None;
             unsafe { list.native.GetDevice(&mut device)? };
@@ -84,8 +83,8 @@ pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg
             }, &mut heap)? };
             let heap = heap.ok_or(E_INVALIDARG)?;
             let mut keep = state.resources.lock().unwrap_or_else(|e| e.into_inner());
-            keep.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
-            keep.push(heap.clone().into());
+            keep.pageables.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
+            keep.pageables.push(heap.clone().into());
             drop(keep);
             state.timestamp_page = Some((heap, 0));
         }

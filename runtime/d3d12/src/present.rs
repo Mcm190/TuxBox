@@ -1,5 +1,6 @@
 //! Present one RGBA8 or RGB10A2 guest texture through a double-buffered DXGI swap chain.
 
+pub(crate) mod hud;
 mod window;
 use window::OutputWindow;
 
@@ -110,6 +111,7 @@ struct SwapChain {
     fence: ID3D12Fence,
     frames: [Frame; 2],
     window: OutputWindow,
+    hud: Option<hud::Overlay>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -151,6 +153,7 @@ impl SwapChain {
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 frames: [Frame::new(device)?, Frame::new(device)?],
                 window,
+                hud: hud::Overlay::new(device, params.Format).ok(),
                 width: params.Width,
                 height: params.Height,
                 format: params.Format,
@@ -193,7 +196,7 @@ impl SwapChain {
             let buffer = self.chain.GetBuffer(index)?;
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
-            record_copy(&frame.list, source, &buffer);
+            record_copy(&frame.list, source, &buffer, self.hud.as_mut(), self.width, self.height);
             let mut samples = [None, None];
             if sampler::due() {
                 samples[0] = sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON);
@@ -280,7 +283,14 @@ fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
     Ok(())
 }
 
-fn record_copy(list: &ID3D12GraphicsCommandList, source: &ID3D12Resource, buffer: &ID3D12Resource) {
+fn record_copy(
+    list: &ID3D12GraphicsCommandList,
+    source: &ID3D12Resource,
+    buffer: &ID3D12Resource,
+    hud: Option<&mut hud::Overlay>,
+    width: u32,
+    height: u32,
+) {
     let transition = |resource: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -311,6 +321,9 @@ fn record_copy(list: &ID3D12GraphicsCommandList, source: &ID3D12Resource, buffer
     unsafe {
         list.ResourceBarrier(&barriers);
         list.CopyResource(buffer, source);
+        if let Some(hud) = hud {
+            hud.record(list, buffer, width, height);
+        }
         for barrier in &mut barriers {
             let transition = &mut *barrier.Anonymous.Transition;
             swap(&mut transition.StateBefore, &mut transition.StateAfter);

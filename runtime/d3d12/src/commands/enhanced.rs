@@ -31,11 +31,10 @@ fn texture_group(api: &ID3D12GraphicsCommandList7, items: &[D3D12_TEXTURE_BARRIE
 }
 
 unsafe fn record(
-    list: &List,
+    owner: *mut c_void,
     native: &ID3D12GraphicsCommandList7,
     groups: &[D3D12_BARRIER_GROUP],
 ) -> Result<(), HRESULT> {
-    let owner = parent(&list.parent);
     for group in groups {
         let count = group.NumBarriers as usize;
         if count == 0 || unsafe { group.Anonymous.pGlobalBarriers.is_null() } {
@@ -144,17 +143,149 @@ unsafe fn record(
     Ok(())
 }
 
+enum Group {
+    Global(Vec<D3D12_GLOBAL_BARRIER>),
+    Buffer(Vec<D3D12_BUFFER_BARRIER>),
+    Texture(Vec<D3D12_TEXTURE_BARRIER>),
+}
+
+pub(super) struct Batch {
+    owner: IUnknown,
+    groups: Vec<Group>,
+    // The D3D12 structs hold borrowed guest pointers in ManuallyDrop fields.
+    resources: Vec<IUnknown>,
+}
+
+impl Batch {
+    // Split barriers and depth handoff copies stay on the original list.
+    unsafe fn capture(
+        list: &List,
+        groups: &[D3D12_BARRIER_GROUP],
+    ) -> windows::core::Result<Option<Self>> {
+        let mut batch = Self {
+            owner: list.parent.clone().ok_or(E_INVALIDARG)?,
+            groups: Vec::new(),
+            resources: Vec::new(),
+        };
+        batch.groups.try_reserve_exact(groups.len()).map_err(|_| E_OUTOFMEMORY)?;
+        for group in groups {
+            let count = group.NumBarriers as usize;
+            if count == 0 || unsafe { group.Anonymous.pGlobalBarriers.is_null() } {
+                return Err(E_INVALIDARG.into());
+            }
+            let captured = match group.Type {
+                D3D12_BARRIER_TYPE_GLOBAL => {
+                    let items = unsafe { slice::from_raw_parts(group.Anonymous.pGlobalBarriers, count) };
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(count).map_err(|_| E_OUTOFMEMORY)?;
+                    copy.extend_from_slice(items);
+                    Group::Global(copy)
+                }
+                D3D12_BARRIER_TYPE_BUFFER => {
+                    let items = unsafe { slice::from_raw_parts(group.Anonymous.pBufferBarriers, count) };
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(count).map_err(|_| E_OUTOFMEMORY)?;
+                    for item in items {
+                        if item.SyncBefore == D3D12_BARRIER_SYNC_SPLIT || item.SyncAfter == D3D12_BARRIER_SYNC_SPLIT {
+                            return Ok(None);
+                        }
+                        batch.retain(&item.pResource)?;
+                        copy.push(unsafe { ptr::read(item) });
+                    }
+                    Group::Buffer(copy)
+                }
+                D3D12_BARRIER_TYPE_TEXTURE => {
+                    let items = unsafe { slice::from_raw_parts(group.Anonymous.pTextureBarriers, count) };
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(count).map_err(|_| E_OUTOFMEMORY)?;
+                    for item in items {
+                        if item.SyncBefore == D3D12_BARRIER_SYNC_SPLIT || item.SyncAfter == D3D12_BARRIER_SYNC_SPLIT {
+                            return Ok(None);
+                        }
+                        let resource = batch.retain(&item.pResource)?;
+                        if resource.state.depth().is_some() {
+                            return Ok(None);
+                        }
+                        copy.push(unsafe { ptr::read(item) });
+                    }
+                    Group::Texture(copy)
+                }
+                _ => return Err(E_NOTIMPL.into()),
+            };
+            batch.groups.push(captured);
+        }
+        Ok(Some(batch))
+    }
+
+    fn retain(
+        &mut self,
+        field: &mem::ManuallyDrop<Option<ID3D12Resource>>,
+    ) -> windows::core::Result<&device::Resource> {
+        let guest = guest_pointer(field)?;
+        // SAFETY: capture runs while the caller holds the guest resource.
+        let resource = unsafe { device::resource_proxy(guest, self.owner.as_raw()) }.ok_or(E_INVALIDARG)?;
+        self.resources.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+        let borrowed = unsafe { IUnknown::from_raw_borrowed(&guest) }.ok_or(E_INVALIDARG)?;
+        self.resources.push(borrowed.clone());
+        Ok(resource)
+    }
+
+    pub(super) fn emit(&self, list: &ID3D12GraphicsCommandList) -> windows::core::Result<()> {
+        let native = list.cast::<ID3D12GraphicsCommandList7>()?;
+        for group in &self.groups {
+            let raw = match group {
+                Group::Global(items) => D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_GLOBAL,
+                    NumBarriers: items.len() as u32,
+                    Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: items.as_ptr() },
+                },
+                Group::Buffer(items) => D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_BUFFER,
+                    NumBarriers: items.len() as u32,
+                    Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: items.as_ptr() },
+                },
+                Group::Texture(items) => D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_TEXTURE,
+                    NumBarriers: items.len() as u32,
+                    Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: items.as_ptr() },
+                },
+            };
+            unsafe { record(self.owner.as_raw(), &native, slice::from_ref(&raw))? };
+        }
+        Ok(())
+    }
+}
+
 pub(super) unsafe extern "system" fn barrier(
     list: &List,
     count: u32,
     groups: *const D3D12_BARRIER_GROUP,
 ) {
     let mut state = recording(list);
-    if count == 0 || !state.can_record(&list.native) {
+    if count == 0 || !state.ensure_open(&list.native) {
         return;
     }
     if groups.is_null() {
         state.error = E_INVALIDARG;
+        return;
+    }
+    let groups = unsafe { slice::from_raw_parts(groups, count as usize) };
+    if state.prefix.accepts_packets() {
+        match unsafe { Batch::capture(list, groups) } {
+            Ok(Some(batch)) => {
+                if let Err(error) = state.prefix.push(&list.native, memory_wait::Packet::Barriers(batch)) {
+                    state.error = error.code();
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.error = error.code();
+                return;
+            }
+        }
+    }
+    if !state.can_record(&list.native) {
         return;
     }
     let Some(native) = list
@@ -165,9 +296,7 @@ pub(super) unsafe extern "system" fn barrier(
         state.error = E_NOTIMPL;
         return;
     };
-    if let Err(error) =
-        unsafe { record(list, native, slice::from_raw_parts(groups, count as usize)) }
-    {
+    if let Err(error) = unsafe { record(parent(&list.parent), native, groups) } {
         crate::diagnostics::recording_error(format_args!(
             "enhanced resource barrier group ({error:?})"
         ));
