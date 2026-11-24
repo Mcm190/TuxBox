@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The documented GeForce run reached player selection at 3840×2160. The Radeon Series S runs reach 1920×1080 presentation with black frames. [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-startup.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The packaged profile reached player selection at 3840×2160 on GeForce and the opening sequence on Radeon. The recorded Radeon Series S runs presented black frames at 1920×1080. [Title progress](PROGRESS.md) · [GeForce run record](../evidence/projectscarlett-startup.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -83,13 +83,15 @@ The server uses its own launch session. `launch` starts the game offline with Ma
 
 The `primary_plane_only` diagnostic presents plane zero when the title submits two planes. With GPU readback enabled, it also samples a compatible secondary plane and logs its RGB and alpha values. For a launch outside MCP, set `TUXBOX_PRESENT_PRIMARY_PLANE=1` before running TuxBox.
 
+Set `TUXBOX_TRACE_GAMEINPUT=1` to log the first gamepad read and button changes. Set `TUXBOX_TRACE_HOST_IMPORTS=1` to record the guest VA range, Windows memory type, resource flags and D3D12 result for each sized buffer heap lookup.
+
 ## Shader preparation
 
 The game records requested shaders in the active prefix, and a worker compiles them while it runs. Pass `--prepare-only` before the package path to compile the available requests into the base prefix's cache before launching. Series S mode starts from a temporary copy of that prefix. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
 
 ## What to expect
 
-The game opens its Americas window, loads its archives and presents 3840×2160 frames. The recorded run reached the player selection prompt, with Account Picker, Screen Narration and TuxBox options. It stopped at a title breakpoint 97 seconds after launch. Intro video, input after player selection and gameplay aren't verified yet. [Current priorities](PROGRESS.md#current-priorities)
+The game opens its Americas window, loads its archives and presents 3840×2160 frames. The player selection prompt shows Account Picker, Screen Narration and TuxBox. The recorded GeForce run stopped at a title breakpoint 97 seconds after launch. On Radeon, Enter maps to controller A and advanced through the six-star loading screen to the opening sequence. Full playback and gameplay remain unverified. [Current priorities](PROGRESS.md#current-priorities)
 
 In a new prefix, the game stops at a breakpoint during System Init because it reads its package through the `G:` drive, as on the console, and the launcher doesn't map that drive yet. A fix is in review. [Pull request #6](https://github.com/brcly/TuxBox/pull/6)
 
@@ -113,9 +115,13 @@ These runs used the matching 1.0.2.1 executable, an RX 9070 XT with Mesa RADV 26
 | Package splash preview | The dump's `xbs_splash.png` is 1920×1080 and opened in a separate desktop window. Game frame verification still requires visible pixels from the title's display planes. |
 | Historical D3D12 provider on Radeon | Built `d3d12_xs.dll` from `c217aa4`, the revision that reported player selection on GeForce, and used the current launcher and installed Proton build. The packaged profile read back black 3840×2160 frames through the clean exit at 106 seconds. |
 | Series S wait and cache-barrier fixes | The trace identified an enhanced barrier and an RTV clear before the rejected GPU wait. TuxBox submitted the list in order and the wait completed. A separate `E_INVALIDARG` came from Device11 slot 131, which the title calls with cache and engine masks and a VA range at RVA `0x1560994`. The corrected mapping uses the enhanced global cache barrier. |
+| Packaged profile with command-buffer import reuse, `1172b73` | Player selection appeared at about 135 seconds. GameInput recorded X, Y and A. Y initiated an account-selection request. A advanced to the six-star screen. Sampled player-selection frame rates were 1.8 FPS before the cache and 7.4 FPS after it, with different diagnostic settings in the two runs. |
+| Packaged profile with A pressed first | The six-star screen was followed by the opening graphic. A GPU readback measured mean RGB `(133, 117, 53)` at 3840×2160, and the window capture showed the full-colour opening artwork. The run closed cleanly at 173.5 seconds. [Opening screenshot](../evidence/projectscarlett-radeon-opening.webp) |
 
 During the initial warm run, the title's slot 86 pipeline stream returned `0x8007007e`. TuxBox's screen-rectangle path loads Windows `dxcompiler.dll` inside the game process. Staging the Windows x64 compiler and validator from DXC v1.8.2505.1 restored that pipeline.
 
 An enhanced barrier and RTV clear can now precede a GPU memory wait while preserving the title's list order. The rejected startup wait went through after this change. The wait fix alone did not restore visible output. The warmed Radeon prefix had 1,726 cached shader translations and 1,411 unsupported requests when checked with `--prepare-only`. The renderer can substitute resource-free shaders for missing compute pipelines, so a successful boot or present does not establish shader coverage.
+
+The Radeon trace correlated 130 host-memory import warnings with `MEM_MAPPED` ranges. Of those, 128 requested unordered-access buffers and two requested buffers with no resource flags. The start page of a sampled 50 MiB UAV came from a single-page `XMemMapPhysicalPages` call. All 130 heap lookups returned success through vkd3d-proton's host-visible fallback. A local GPU probe read zero from a section-backed fallback buffer after CPU writes, while private placeholder memory preserved those writes. The affected UAVs need backing that keeps CPU mappings and GPU writes coherent. [vkd3d-proton host-memory fallback](https://github.com/HansKristian-Work/vkd3d-proton/blob/master/libs/vkd3d/memory.c#L1110-L1134)
 
 VIctory reports working first-boot menus and intro video on its Windows backend. An xcl report for this package reached first-run setup and later hit a title fault. Both projects select the primary display plane on the host. In TuxBox, 35 shader programs that reported sampler errors without a root signature also had requests with their pipeline root attached. The rooted variants progressed past that sampler error, with several then refused on divergent wave reductions. [VIctory status](https://github.com/Marvisak/VIctory) · [VIctory presentation](https://github.com/Marvisak/VIctory/blob/main/crates/victory-gpu/src/queue.rs) · [xcl first-run report](https://github.com/ivall/xcl/issues/846) · [xcl presentation](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/d3d12x/present.rs)

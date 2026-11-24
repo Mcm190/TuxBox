@@ -284,11 +284,23 @@ pub(super) fn import_buffer_with_heap(
     crate::diagnostics::watch("imported buffer", address, info.SizeInBytes, || format!(
         "width={:#x} flags={:#x} state={:#x}", desc.Width, desc.Flags.0, state.0));
     let pin = GPU_APERTURE.pin(base, size)?;
-    validate_shared_range(base, base.checked_add(size).ok_or(E_INVALIDARG)?)?;
+    let memory_types = validate_shared_range(base, base.checked_add(size).ok_or(E_INVALIDARG)?)?;
     // A guest can place thousands of tiny resources in one multi-GiB XMem
     // reservation. Pin only the pages needed by this resource on the adapter.
     let heap = if let Ok(sized) = device.native.cast::<ID3D12Device13>() {
-        device.state.page_pools.import(&sized, base, size, pin)?
+        let imported = device.state.page_pools.import(&sized, base, size, pin);
+        static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("TUXBOX_TRACE_HOST_IMPORTS").is_some_and(|v| v == "1")
+        });
+        if *TRACE {
+            let status = imported.as_ref().err().map_or(0, |error| error.code().0);
+            let caller = crate::survey::title_rva().unwrap_or(0);
+            crate::diagnostics::log(&format!(
+                "buffer heap lookup {base:#x}+{size:#x} types={memory_types:#x} status={status:#010x} flags={:#x} state={:#x} from title RVA {caller:#x}",
+                desc.Flags.0, state.0,
+            ));
+        }
+        imported?
     } else {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(Some(base as _), &mut region, size_of_val(&region)) } == 0
@@ -724,18 +736,20 @@ pub(super) unsafe extern "system" fn committed_layout(
     unsafe { wrap_pageable(Ok(native), &RESOURCE, device, super::ResourceState::from(backing), out) }
 }
 
-fn validate_shared_range(start: u64, end: u64) -> windows::core::Result<()> {
+fn validate_shared_range(start: u64, end: u64) -> windows::core::Result<u32> {
     use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
     let mut cursor = start;
+    let mut types = 0;
     while cursor < end {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(Some(cursor as _), &mut region, size_of_val(&region)) } == 0
             || region.State != MEM_COMMIT || region.Protect != PAGE_READWRITE {
             return Err(E_INVALIDARG.into());
         }
+        types |= region.Type.0;
         cursor = (region.BaseAddress as u64).checked_add(region.RegionSize as u64).ok_or(E_INVALIDARG)?;
     }
-    Ok(())
+    Ok(types)
 }
 
 pub(super) unsafe extern "system" fn register_pages(

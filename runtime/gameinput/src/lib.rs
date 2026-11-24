@@ -6,7 +6,7 @@ use sample::{DesktopPad, KEYS, MOUSE, MouseMotion, PAD, PORTS, Pad, Sample};
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::{
-    Arc, LazyLock, Mutex,
+    Arc, LazyLock, Mutex, Once,
     atomic::{AtomicU32, Ordering},
 };
 use std::time::Instant;
@@ -21,6 +21,18 @@ const HISTORY: usize = 256;
 const INPUT_IID: GUID = GUID::from_u128(0x11be2a7e_4254_445a_9c09_ffc40f006918);
 const DEVICE_IID: GUID = GUID::from_u128(0x31dd86fb_4c1b_408a_868f_439b3cd47125);
 const READING_IID: GUID = GUID::from_u128(0x2156947a_e1fa_4de0_a30b_d812931dbd8d);
+
+fn trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("TUXBOX_TRACE_GAMEINPUT").is_some_and(|v| v == "1"));
+    *ENABLED
+}
+
+fn trace(message: std::fmt::Arguments<'_>) {
+    use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
+    let line = format!("TuxBox gameinput: {message}\n\0");
+    unsafe { OutputDebugStringA(line.as_ptr()) };
+}
 
 // These immutable objects are the vtables defined by the matching C SDK.
 unsafe extern "C" {
@@ -183,6 +195,17 @@ impl Pool {
             {
                 continue;
             }
+            if trace_enabled() && let Sample::Pad(pad) = &data {
+                let previous = self.latest[slot].as_ref().and_then(|reading| {
+                    match &reading.reading().sample {
+                        Sample::Pad(pad) => Some(pad.buttons),
+                        _ => None,
+                    }
+                });
+                if previous != Some(pad.buttons) {
+                    trace(format_args!("pad slot {slot} buttons={:#06x}", pad.buttons));
+                }
+            }
             self.number += 1;
             let reading = Arc::new(Object {
                 table: unsafe { &gi_reading_table },
@@ -275,6 +298,10 @@ unsafe extern "system" fn create(out: *mut *const Object) -> i32 {
         return E_POINTER;
     }
     unsafe { out.write(Arc::into_raw(Arc::clone(&MANAGER))) };
+    if trace_enabled() {
+        static FIRST: Once = Once::new();
+        FIRST.call_once(|| trace(format_args!("GameInputCreate")));
+    }
     S_OK
 }
 
@@ -330,6 +357,15 @@ unsafe extern "system" fn gi_read(
             state.history.range(..index).rev().find(matches)
         }
     };
+    if trace_enabled() {
+        static OTHER_READ: Once = Once::new();
+        static PAD_READ: Once = Once::new();
+        let first = if mask & PAD != 0 { &PAD_READ } else { &OTHER_READ };
+        first.call_once(|| trace(format_args!(
+            "read mask={mask:#x} direction={direction} explicit_device={} status={:#010x}",
+            !device.is_null(), if found.is_some() { S_OK } else { NO_READING },
+        )));
+    }
     let Some(reading) = found else {
         return NO_READING;
     };
