@@ -158,6 +158,29 @@ pub(super) fn resource_base(ex: &ShaderExtract) -> Option<u8> {
 /// one the shader declares (PSV) is preferred. `compare` selects comparison
 /// samplers (depth-compare image ops) and only those.
 pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: bool) -> Option<(u32, u32)> {
+    let samplers = ex.root_sig.as_ref().map_or(ex.pipeline_samplers.as_slice(), |root| {
+        root.static_samplers.as_slice()
+    });
+    if let Some(hit) = static_sampler(ex.stage, samplers, &ex.resources, literal, compare) {
+        return Some(hit);
+    }
+    if ex.root_sig.is_some() {
+        return None;
+    }
+    // A root-less stage can also address the single sampler the PSV declares.
+    // Only accept words shaped like a static sampler (word 1 = MAX_LOD 12, no bias).
+    let mut declared = ex.resources.iter().filter(|r| r.res_type == 1);
+    let sampler = declared.next()?;
+    if declared.next().is_some() || sampler.lower != sampler.upper || literal[1] != 0x00c00000 {
+        return None;
+    }
+    Some((sampler.lower, sampler.space))
+}
+
+fn static_sampler(
+    stage: Stage, samplers: &[[u32; 13]], resources: &[crate::psv::PsvResource],
+    literal: [u32; 4], compare: bool,
+) -> Option<(u32, u32)> {
     fn address(mode: u32) -> Option<u32> {
         match mode {
             1 => Some(0),
@@ -168,7 +191,7 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: boo
     }
     let state = |s: &[u32; 13]| -> Option<(u32, u32)> {
         let [filter, u, v, w, bias, aniso, func, border, min, max, slot, space, vis] = *s;
-        if !(vis == 0 || matches!((vis, ex.stage), (1, Stage::Vertex) | (5, Stage::Pixel)))
+        if !(vis == 0 || matches!((vis, stage), (1, Stage::Vertex) | (5, Stage::Pixel)))
             || (bias, aniso, min, max) != (0, 1, 0, 12.0_f32.to_bits())
             || (filter & 0x80 != 0) != compare
             || border > 2
@@ -189,29 +212,25 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: boo
         (literal == [word0, 0x00c00000, filter, border << 30]).then_some((slot, space))
     };
     let declared = |&(slot, space): &(u32, u32)| {
-        ex.resources.iter().any(|r| (r.res_type, r.lower, r.upper, r.space) == (1, slot, slot, space))
+        resources.iter().any(|r| (r.res_type, r.lower, r.upper, r.space) == (1, slot, slot, space))
     };
-    let Some(root) = ex.root_sig.as_ref() else {
-        // Root-less programs: the title's own root signature supplies the static
-        // sampler. With the pipeline's static samplers attached, bind the words
-        // to a slot whose state they encode exactly, preferring one PSV declares.
-        // Every such slot samples identically, and the pipeline root holds all.
-        let pipeline = &ex.pipeline_samplers;
-        if let Some(hit) = pipeline.iter().filter_map(state).find(declared).or_else(|| pipeline.iter().find_map(state)) {
-            return Some(hit);
-        }
-        // Otherwise bind the inline words to the one sampler PSV declares. Only
-        // accept words shaped like a static sampler (word 1 = MAX_LOD 12, no bias).
-        let mut declared = ex.resources.iter().filter(|r| r.res_type == 1);
-        let sampler = declared.next()?;
-        if declared.next().is_some() || sampler.lower != sampler.upper || literal[1] != 0x00c00000 {
-            return None;
-        }
-        return Some((sampler.lower, sampler.space));
-    };
-    let samplers = &root.static_samplers;
     samplers.iter().filter_map(state).find(declared)
         .or_else(|| samplers.iter().find_map(state))
+}
+
+#[test]
+fn static_samplers_match_the_binding_and_stage_visibility() {
+    let wrap_point = [0, 1, 1, 1, 0, 1, 1, 0, 0, 12.0_f32.to_bits(), 1, 0, 0];
+    let mut vertex_sampler = wrap_point;
+    vertex_sampler[10..].copy_from_slice(&[2, 3, 1]);
+    let declared = [crate::psv::PsvResource {
+        res_type: 1, space: 3, lower: 2, upper: 2,
+    }];
+    let literal = [0, 0x00c00000, 0x14000000, 0];
+    let samplers = [wrap_point, vertex_sampler];
+    assert_eq!(static_sampler(Stage::Vertex, &samplers, &declared, literal, false), Some((2, 3)));
+    assert_eq!(static_sampler(Stage::Pixel, &samplers, &declared, literal, false), Some((1, 0)));
+    assert_eq!(static_sampler(Stage::Pixel, &[vertex_sampler], &declared, literal, false), None);
 }
 
 /// An empty EXEC branch can skip inline sampler initialization only when the
