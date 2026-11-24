@@ -9,6 +9,7 @@ use super::{INVALID, OK, Object, POINTER, queue};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const E_PENDING: i32 = 0x8000000Au32 as i32;
 const NOT_FOUND: i32 = 0x80070490u32 as i32;
@@ -169,17 +170,21 @@ pub(super) unsafe extern "system" fn user_max_users(_: &Object, out: *mut u32) -
 /// XUserAddAsync: every add request signs in the same local user.
 pub(super) unsafe extern "system" fn user_add_async(_: &Object, options: u32, block: *mut c_void) -> i32 {
     super::report(format_args!("XUserAddAsync options {options:#x}: signing in the local user"));
-    unsafe { complete(block, OK, 0, Payload::User) }
+    unsafe { complete(block, OK, size_of::<*mut c_void>(), Payload::User) }
 }
 pub(super) unsafe extern "system" fn user_add_result(_: &Object, block: *mut c_void, out: *mut *mut c_void) -> i32 {
     if out.is_null() { return POINTER; }
     match take(block) {
         Ok(Payload::User) => {
             unsafe { out.write(user_handle()) };
+            super::report(format_args!("XUserAddResult returned the local user"));
             OK
         }
         Ok(_) => INVALID,
-        Err(status) => status,
+        Err(status) => {
+            super::report(format_args!("XUserAddResult failed {:#010x}", status as u32));
+            status
+        }
     }
 }
 pub(super) unsafe extern "system" fn user_local_id(_: &Object, user: *mut c_void, out: *mut u64) -> i32 {
@@ -461,6 +466,95 @@ pub(super) extern "system" fn display_try_hdr(_: &Object, _preference: u32, _inf
 }
 
 // ---------------------------------------------------------------------------
+// XAccessibility. The title owns the subtitle toggle and renders the captions.
+static CAPTIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[repr(C)]
+pub(super) struct CaptionProperties {
+    background: [u8; 4],
+    text: [u8; 4],
+    window: [u8; 4],
+    edge: u32,
+    font: u32,
+    scale: f32,
+    enabled: bool,
+}
+
+const _: () = assert!(size_of::<CaptionProperties>() == 28);
+
+pub(super) unsafe extern "system" fn caption_properties(
+    _: &Object, out: *mut CaptionProperties,
+) -> i32 {
+    if out.is_null() {
+        return POINTER;
+    }
+    if !CAPTIONS_ENABLED.load(Ordering::Acquire) {
+        super::report(format_args!("XClosedCaptionGetProperties: captions disabled"));
+        return NOT_FOUND;
+    }
+    // The GDK uses alpha, red, green, blue bytes in each XColor.
+    unsafe {
+        out.write(CaptionProperties {
+            background: [192, 0, 0, 0],
+            text: [255; 4],
+            window: [0; 4],
+            edge: 0,
+            font: 0,
+            scale: 1.0,
+            enabled: true,
+        });
+    }
+    OK
+}
+
+pub(super) extern "system" fn caption_set_enabled(_: &Object, enabled: bool) -> i32 {
+    CAPTIONS_ENABLED.store(enabled, Ordering::Release);
+    OK
+}
+
+pub(super) unsafe extern "system" fn high_contrast_mode(_: &Object, out: *mut u32) -> i32 {
+    if out.is_null() {
+        return POINTER;
+    }
+    // The offline console profile uses the default contrast setting.
+    unsafe { out.write(0) };
+    super::report(format_args!("XHighContrastGetMode returned Off"));
+    OK
+}
+
+// The offline profile has no installed voices. Keep the synthesizer handle
+// valid for title startup while the speech stream methods remain unsupported.
+static SPEECH_SYNTHESIZER: u8 = 0;
+
+type VoiceCallback = unsafe extern "system" fn(*const c_void, *mut c_void) -> bool;
+
+pub(super) extern "system" fn speech_voices(
+    _: &Object, _context: *mut c_void, callback: Option<VoiceCallback>,
+) -> i32 {
+    if callback.is_none() {
+        return POINTER;
+    }
+    super::report(format_args!("XSpeechSynthesizerEnumerateInstalledVoices found no offline voices"));
+    OK
+}
+
+pub(super) unsafe extern "system" fn speech_create(_: &Object, out: *mut *const u8) -> i32 {
+    if out.is_null() {
+        return POINTER;
+    }
+    unsafe { out.write(&raw const SPEECH_SYNTHESIZER) };
+    super::report(format_args!("XSpeechSynthesizerCreate supplied an offline handle"));
+    OK
+}
+
+pub(super) extern "system" fn speech_close(_: &Object, handle: *const u8) -> i32 {
+    if handle.is_null() || std::ptr::eq(handle, &SPEECH_SYNTHESIZER) {
+        OK
+    } else {
+        INVALID
+    }
+}
+
 // XGameSave (class 704c3f58). One provider per process, stored in a folder
 // beside the persistent local storage path.
 

@@ -83,6 +83,7 @@ unsafe extern "system" fn QueryApiImpl(
             .filter(|&i| i == probe::GAMERTAG);
         if let Some(index) = by_interface.or_else(|| probe::CLASSES.iter().position(|(c, _)| same(c, class)))
             && probe::available(index)
+            && (index != probe::ACCESSIBILITY || same(iid, &probe::ACCESSIBILITY_IID))
         {
             // report() dedups, so each served class is logged once.
             report(format_args!("serving {} (interface {})", probe::CLASSES[index].1, guid_text(iid)));

@@ -1,9 +1,9 @@
 //! Survey of runtime API classes TuxBox does not implement yet. Each class
 //! answers QueryApiImpl with an interface whose every method logs its slot,
 //! the first five integer arguments and the caller, then returns E_NOTIMPL.
-//! The six identified classes are served by `services` (slots it implements)
-//! by default; TUXBOX_RUNTIME_SERVICES=0 withholds them. TUXBOX_RUNTIME_PROBE=1
-//! also exposes the unidentified class.
+//! Known offline interfaces are served by `services` by default.
+//! TUXBOX_RUNTIME_SERVICES=0 withholds them. TUXBOX_RUNTIME_PROBE=1
+//! also exposes probe-only classes.
 use super::{NOT_IMPLEMENTED, Object, Slot, report};
 use std::sync::atomic::AtomicU32;
 use windows_sys::core::GUID;
@@ -15,7 +15,7 @@ pub(super) const CLASSES: [(GUID, &str); 10] = [
     (GUID::from_u128(0xf4faf4d4_2d04_4fce_b3e0_474a713a3e84), "XPersistentLocalStorage"),
     (GUID::from_u128(0x37e56907_2f10_41e8_b72f_36edb185331a), "XNetworking"),
     (GUID::from_u128(0x03f0fe74_fdd9_4e5c_b630_f9339c47acc5), "XDisplay"),
-    (GUID::from_u128(0x3e241977_6237_41e9_8559_102c2d9983f1), "Unknown3e241977"),
+    (GUID::from_u128(0x3e241977_6237_41e9_8559_102c2d9983f1), "XAccessibility"),
     (GUID::from_u128(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b), "Unknownb884675d"),
     (GUID::from_u128(0x704c3f58_e629_4cc2_b197_30511b996fe2), "XGameSave"),
     // XUser's gamertag interface (IID cef4fac0); selected by IID, not class.
@@ -24,6 +24,9 @@ pub(super) const CLASSES: [(GUID, &str); 10] = [
 
 /// Interfaces chosen by IID within a class.
 pub(super) const GAMERTAG: usize = 9;
+pub(super) const ACCESSIBILITY: usize = 6;
+pub(super) const ACCESSIBILITY_IID: GUID =
+    GUID::from_u128(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d);
 
 pub(super) fn enabled() -> bool {
     std::env::var_os("TUXBOX_RUNTIME_PROBE").is_some_and(|v| v == "1")
@@ -112,10 +115,16 @@ static TABLES: [[Slot; 64]; 10] = {
     t[4][16] = service!(network_register);
     // XDisplay
     t[5][4] = service!(display_try_hdr);
+    t[ACCESSIBILITY][3] = service!(caption_properties);
+    t[ACCESSIBILITY][4] = service!(caption_set_enabled);
+    t[ACCESSIBILITY][5] = service!(high_contrast_mode);
+    t[ACCESSIBILITY][8] = service!(speech_voices);
+    t[ACCESSIBILITY][9] = service!(speech_create);
+    t[ACCESSIBILITY][10] = service!(speech_close);
     t
 };
 
-/// Classes with offline services; the last (unidentified) one is probe-only.
+/// Classes with offline services. Unidentified classes are probe-only.
 /// TUXBOX_RUNTIME_SERVICES=0 withholds all of them; a comma-separated list of
 /// class names (for example `XUser,XGame`) offers only those.
 pub(super) fn available(index: usize) -> bool {
@@ -124,7 +133,7 @@ pub(super) fn available(index: usize) -> bool {
         Ok(list) if list == "0" => false,
         Ok(list) => list.split(',').any(|name| name.trim() == CLASSES[index].1),
     };
-    (index < 6 || index == 8 || index == GAMERTAG) && selected || enabled()
+    (index <= ACCESSIBILITY || index == 8 || index == GAMERTAG) && selected || enabled()
 }
 pub(super) static OBJECTS: [super::ProbeObject; 10] = {
     let mut i = 0;

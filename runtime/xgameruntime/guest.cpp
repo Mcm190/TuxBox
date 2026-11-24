@@ -15,6 +15,8 @@ static const GUID threading{0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9,
 static const GUID system_api{0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
 static const GUID system_revision{0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
 static const GUID unknown{};
+static const GUID accessibility{0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+static const GUID accessibility_interface{0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 using Handle = UINT_PTR;
 using Action = void(WINAPI*)(void*, bool);
 using Finished = void(WINAPI*)(void*);
@@ -49,6 +51,19 @@ static void WINAPI terminated(void* context) {
 }
 #define CHECK(x) do { if (!(x)) {std::fprintf(stderr, "runtime control failed at line %d\n", __LINE__); return 1;} } while (0)
 
+struct CaptionProperties {
+    unsigned char background[4], text[4], window[4];
+    UINT edge, font;
+    float scale;
+    bool enabled;
+};
+static_assert(sizeof(CaptionProperties) == 28);
+
+static bool WINAPI count_voice(const void*, void* context) {
+    ++*static_cast<UINT*>(context);
+    return true;
+}
+
 int main(int argc, char** argv) {
     void* obj = reinterpret_cast<void*>(1);
     CHECK(FAILED(QueryApiImpl(&threading, &threading, &obj)) && !obj);
@@ -57,6 +72,27 @@ int main(int argc, char** argv) {
     UninitializeApiImpl();
     CHECK(QueryApiImpl(&unknown, &threading, &obj) == E_NOINTERFACE && !obj);
     CHECK(QueryApiImpl(&threading, &unknown, &obj) == E_NOINTERFACE && !obj);
+    CHECK(QueryApiImpl(&accessibility, &unknown, &obj) == E_NOINTERFACE && !obj);
+    void* access{};
+    CHECK(SUCCEEDED(QueryApiImpl(&accessibility, &accessibility_interface, &access)) && access);
+    const auto get_captions = method<HRESULT(WINAPI*)(void*, CaptionProperties*)>(access, 3);
+    const auto set_captions = method<HRESULT(WINAPI*)(void*, bool)>(access, 4);
+    CaptionProperties captions{};
+    CHECK(FAILED(get_captions(access, &captions)));
+    CHECK(SUCCEEDED(set_captions(access, true)));
+    CHECK(SUCCEEDED(get_captions(access, &captions)) && captions.enabled && captions.scale == 1.0f);
+    CHECK(SUCCEEDED(set_captions(access, false)) && FAILED(get_captions(access, &captions)));
+    UINT mode = 0xff;
+    CHECK(SUCCEEDED(method<HRESULT(WINAPI*)(void*, UINT*)>(access, 5)(access, &mode)) && mode == 0);
+    const void* speech{};
+    CHECK(SUCCEEDED(method<HRESULT(WINAPI*)(void*, const void**)>(access, 9)(access, &speech)) && speech);
+    UINT voices = 0;
+    using VoiceCallback = bool(WINAPI*)(const void*, void*);
+    using EnumerateVoices = HRESULT(WINAPI*)(void*, void*, VoiceCallback);
+    CHECK(SUCCEEDED(method<EnumerateVoices>(access, 8)(access, &voices, count_voice)) && voices == 0);
+    CHECK(SUCCEEDED(method<HRESULT(WINAPI*)(void*, const void*)>(access, 10)(access, speech)));
+    method<Ref>(access, 2)(access);
+
     void *system{};
     CHECK(SUCCEEDED(QueryApiImpl(&system_api, &system_revision, &system)) && system);
     using SandboxId = HRESULT(WINAPI*)(void*, size_t, char*, size_t*);
