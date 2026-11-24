@@ -29,7 +29,8 @@ KEYS = {
 }
 WINDOW_ID = re.compile(r"0x[0-9a-f]+")
 MILESTONES = re.compile(
-    r"PresentX|sample #\d+ res=|XUserAddAsync|pipeline stream .* failed|"
+    r"PresentX|sample #\d+ res=|display writes recorded|recorded raster draw|"
+    r"screen-rectangle pipeline|XUserAddAsync|pipeline stream .* failed|"
     r"device lost|DXGI_ERROR_DEVICE|breakpoint|Game exited|Launch failed",
     re.IGNORECASE,
 )
@@ -52,13 +53,16 @@ TOOLS = [
     tool("launch", "Start GTA VI offline with MangoHud and periodic GPU readback.", {
         "trace_interval": {"type": "integer", "minimum": 0, "maximum": 36000, "default": 600},
         "profile": {"type": "string", "enum": ["packaged", "series-s"], "default": "packaged"},
+        "trace_draws": {"type": "boolean", "default": False},
+        "primary_plane_only": {"type": "boolean", "default": False},
     }),
     tool("status", "Read the launch state, recent log lines, graphics milestones, and frame telemetry.", {
         "lines": {"type": "integer", "minimum": 0, "maximum": 100, "default": 20},
     }),
     tool("screenshot", "Capture the game window as a PNG and save it with the run."),
-    tool("press", "Press a virtual controller button on the focused game window.", {
+    tool("press", "Press a virtual controller button on the game window, optionally focusing it first.", {
         "button": {"type": "string", "enum": list(KEYS)},
+        "focus": {"type": "boolean", "default": False},
     }, ("button",)),
     tool("stop", "Ask the game window to close and wait briefly for the launcher's exit."),
 ]
@@ -117,21 +121,38 @@ def x_display():
         lib.XCloseDisplay(display)
 
 
+def window_message(lib, display, window, target, kind, value, mask=0):
+    lib.XInternAtom.argtypes = [C.c_void_p, C.c_char_p, C.c_int]
+    lib.XInternAtom.restype = C.c_ulong
+    lib.XSendEvent.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_long, C.POINTER(XEvent)]
+    atom = lib.XInternAtom(display, kind, 0)
+    data = lib.XInternAtom(display, value, 0) if isinstance(value, bytes) else value
+    event = XEvent(message=ClientMessage(
+        33, 0, 1, display, window, atom, 32, (C.c_long * 5)(data),
+    ))
+    if not lib.XSendEvent(display, target, 0, mask, C.byref(event)):
+        raise ValueError(f"The desktop rejected {kind.decode()}")
+
+
 def close_window(window):
     with x_display() as (lib, display):
-        lib.XInternAtom.argtypes = [C.c_void_p, C.c_char_p, C.c_int]
-        lib.XInternAtom.restype = C.c_ulong
-        lib.XSendEvent.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_long, C.POINTER(XEvent)]
-        protocols = lib.XInternAtom(display, b"WM_PROTOCOLS", 0)
-        delete = lib.XInternAtom(display, b"WM_DELETE_WINDOW", 0)
-        event = XEvent(message=ClientMessage(
-            33, 0, 1, display, window, protocols, 32, (C.c_long * 5)(delete),
-        ))
-        if not lib.XSendEvent(display, window, 0, 0, C.byref(event)):
-            raise ValueError("The desktop rejected the close request")
+        window_message(lib, display, window, window, b"WM_PROTOCOLS", b"WM_DELETE_WINDOW")
 
 
-def send_key(window, keysym):
+def activate_window(lib, display, window):
+    lib.XDefaultRootWindow.argtypes = [C.c_void_p]
+    lib.XDefaultRootWindow.restype = C.c_ulong
+    root = lib.XDefaultRootWindow(display)
+    # The window manager handles EWMH activation requests sent to the root window.
+    window_message(lib, display, window, root, b"_NET_ACTIVE_WINDOW", 2, (1 << 19) | (1 << 20))
+    lib.XSync(display, 0)
+    for _ in range(10):
+        if window_ids(xprop("-root", "_NET_ACTIVE_WINDOW")) == [window]:
+            return
+        time.sleep(0.05)
+
+
+def send_key(window, keysym, focus=False):
     with x_display() as (lib, display):
         lib.XKeysymToKeycode.argtypes = [C.c_void_p, C.c_ulong]
         lib.XKeysymToKeycode.restype = C.c_ubyte
@@ -139,6 +160,8 @@ def send_key(window, keysym):
         xtest = C.CDLL("libXtst.so.6")
         xtest.XTestFakeKeyEvent.argtypes = [C.c_void_p, C.c_uint, C.c_int, C.c_ulong]
         key = lib.XKeysymToKeycode(display, keysym)
+        if focus and window_ids(xprop("-root", "_NET_ACTIVE_WINDOW")) != [window]:
+            activate_window(lib, display, window)
         if not key or window_ids(xprop("-root", "_NET_ACTIVE_WINDOW")) != [window]:
             raise ValueError("The GTA VI window must be focused to send input")
         if not xtest.XTestFakeKeyEvent(display, key, 1, 0):
@@ -176,16 +199,25 @@ class ScarlettSession:
                 continue  # The window can disappear between enumeration and inspection.
         return None
 
-    def launch(self, trace_interval=600, profile="packaged"):
+    def launch(self, trace_interval=600, profile="packaged", trace_draws=False, primary_plane_only=False):
         if self.process is not None and self.process.poll() is None:
             raise ValueError("A GTA VI launch is already running")
         interval = checked_int(trace_interval, 0, 36000, "trace_interval")
+        if type(trace_draws) is not bool:
+            raise ValueError("trace_draws must be true or false")
+        if type(primary_plane_only) is not bool:
+            raise ValueError("primary_plane_only must be true or false")
         if profile not in ("packaged", "series-s"):
             raise ValueError("Unknown graphics profile")
         self.args.output.mkdir(parents=True, exist_ok=True)
         self.run_dir = Path(mkdtemp(prefix="run-", dir=self.args.output))
         self.run_id = uuid.uuid4().hex
         env = dict(os.environ, TUXBOX_MCP_RUN_ID=self.run_id, TUXBOX_TRACE_PRESENT=str(interval))
+        if trace_draws:
+            env.update(TUXBOX_TRACE_RASTER_DRAWS="1", TUXBOX_TRACE_RASTER_INPUTS="1",
+                       TUXBOX_CAPTURE_DRAW_READBACK="1")
+        if primary_plane_only:
+            env["TUXBOX_PRESENT_PRIMARY_PLANE"] = "1"
         command = [
             sys.executable, str(ROOT / "tuxbox.py"), "run",
             "--offline", "--mangohud", "--prefix", str(self.args.prefix),
@@ -249,10 +281,12 @@ class ScarlettSession:
             {"type": "image", "mimeType": "image/png", "data": base64.b64encode(path.read_bytes()).decode("ascii")},
         ]
 
-    def press(self, button):
+    def press(self, button, focus=False):
         if button not in KEYS:
             raise ValueError("Unknown controller button")
-        send_key(self.game_window(), KEYS[button])
+        if type(focus) is not bool:
+            raise ValueError("focus must be true or false")
+        send_key(self.game_window(), KEYS[button], focus)
         return {"pressed": button}
 
     def stop(self):

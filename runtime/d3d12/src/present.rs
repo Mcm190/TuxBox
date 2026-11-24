@@ -20,8 +20,13 @@ pub(crate) struct Presentation {
 }
 
 impl Presentation {
-    pub(crate) fn present(&self, queue: &ID3D12CommandQueue, source: &ID3D12Resource) -> HRESULT {
-        self.present_texture(queue, source)
+    pub(crate) fn present(
+        &self,
+        queue: &ID3D12CommandQueue,
+        source: &ID3D12Resource,
+        secondary: Option<&ID3D12Resource>,
+    ) -> HRESULT {
+        self.present_texture(queue, source, secondary)
             .unwrap_or_else(|error| error.code())
     }
 
@@ -29,6 +34,7 @@ impl Presentation {
         &self,
         queue: &ID3D12CommandQueue,
         source: &ID3D12Resource,
+        secondary: Option<&ID3D12Resource>,
     ) -> Result<HRESULT> {
         // SAFETY: source is a live native resource held by the caller.
         let desc = unsafe { source.GetDesc() };
@@ -56,7 +62,7 @@ impl Presentation {
             Some(chain) => chain,
             None => session.insert(SwapChain::new(queue, &device, &desc)?),
         };
-        let status = chain.present(queue, source, &desc)?;
+        let status = chain.present(queue, source, &desc, secondary)?;
         if status == S_OK {
             crate::diagnostics::presented(desc.Width, desc.Height);
         }
@@ -76,6 +82,7 @@ struct Frame {
     list: ID3D12GraphicsCommandList,
     // ExecuteCommandLists does not retain resource references until GPU completion.
     source: Option<ID3D12Resource>,
+    samples: [Option<sampler::Sample>; 2],
     retire: u64,
 }
 
@@ -91,6 +98,7 @@ impl Frame {
                 allocator,
                 list,
                 source: None,
+                samples: [None, None],
                 retire: 0,
             })
         }
@@ -157,6 +165,7 @@ impl SwapChain {
         queue: &ID3D12CommandQueue,
         source: &ID3D12Resource,
         desc: &D3D12_RESOURCE_DESC,
+        secondary: Option<&ID3D12Resource>,
     ) -> Result<HRESULT> {
         if let Some((failure, _)) = &self.failed_signal {
             return Err((*failure).into());
@@ -185,18 +194,35 @@ impl SwapChain {
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
             record_copy(&frame.list, source, &buffer);
-            let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
+            let mut samples = [None, None];
+            if sampler::due() {
+                samples[0] = sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON);
+                if let Some(overlay) = secondary.filter(|overlay| {
+                    let d = overlay.GetDesc();
+                    overlay.as_raw() != source.as_raw()
+                        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && d.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+                        && d.DepthOrArraySize == 1 && d.MipLevels == 1 && d.SampleDesc.Count == 1
+                }) {
+                    samples[1] = sampler::record(&frame.list, overlay, D3D12_RESOURCE_STATE_COMMON);
+                }
+            }
             frame.list.Close()?;
             frame.source = Some(source.clone());
+            frame.samples = samples;
             queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
             if let Err(error) = queue.Signal(&self.fence, self.next) {
                 self.failed_signal = Some((error.code(), queue.clone()));
                 return Err(error);
             }
             frame.retire = self.next;
-            if let Some(sample) = sample {
+            if frame.samples.iter().any(Option::is_some) {
                 wait_for(&self.fence, self.next)?;
-                sample.report("present");
+                for (sample, label) in frame.samples.iter_mut().zip(["present", "secondary present"]) {
+                    if let Some(sample) = sample.take() {
+                        sample.report(label);
+                    }
+                }
             }
             self.next = next_value;
             // Return DXGI status codes such as DXGI_STATUS_OCCLUDED to the guest.
@@ -318,7 +344,7 @@ pub(crate) mod sampler {
         buffer: ID3D12Resource,
         layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         index: u64,
-        source: usize,
+        source: ID3D12Resource,
     }
 
     /// Record a copy of subresource 0 into a readback buffer, after
@@ -379,7 +405,7 @@ pub(crate) mod sampler {
             std::mem::ManuallyDrop::drop(&mut dst.pResource);
             std::mem::ManuallyDrop::drop(&mut src.pResource);
         }
-        Some(Sample { buffer, layout, index: INDEX.fetch_add(1, Ordering::Relaxed), source: windows::core::Interface::as_raw(source) as usize })
+        Some(Sample { buffer, layout, index: INDEX.fetch_add(1, Ordering::Relaxed), source: source.clone() })
     }
 
     impl Sample {
@@ -392,13 +418,13 @@ pub(crate) mod sampler {
             }
             let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
             let data = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), pitch * h) };
-            let (mut lit, mut sum, mut grid) = (0u64, [0u64; 3], [[0u64; 4]; 4]);
+            let (mut lit, mut sum, mut grid) = (0u64, [0u64; 4], [[0u64; 4]; 4]);
             for y in (0..h).step_by(4) {
                 for x in (0..w).step_by(4) {
                     let p = &data[y * pitch + x * 4..y * pitch + x * 4 + 4];
                     let luma = u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]);
                     if luma > 6 { lit += 1; }
-                    for c in 0..3 { sum[c] += u64::from(p[c]); }
+                    for c in 0..4 { sum[c] += u64::from(p[c]); }
                     grid[y * 4 / h][x * 4 / w] += luma;
                 }
             }
@@ -406,8 +432,11 @@ pub(crate) mod sampler {
             let cells: Vec<String> = grid.iter().map(|row| row.iter()
                 .map(|&v| format!("{:3}", v / (n / 16).max(1) / 3)).collect::<Vec<_>>().join(" ")).collect();
             unsafe { self.buffer.Unmap(0, None) };
-            let line = format!("{name} sample #{} res={:#x} {}x{} format={} lit={:.3} mean=({},{},{}) grid=[{}]",
-                self.index, self.source, w, h, f.Format.0, lit as f64 / n as f64, sum[0] / n, sum[1] / n, sum[2] / n, cells.join(" | "));
+            let alpha = (f.Format == super::DXGI_FORMAT_R8G8B8A8_UNORM)
+                .then(|| format!(" mean_alpha={}", sum[3] / n)).unwrap_or_default();
+            let line = format!("{name} sample #{} res={:#x} {}x{} format={} lit={:.3} mean=({},{},{}){alpha} grid=[{}]",
+                self.index, windows::core::Interface::as_raw(&self.source) as usize, w, h, f.Format.0,
+                lit as f64 / n as f64, sum[0] / n, sum[1] / n, sum[2] / n, cells.join(" | "));
             crate::diagnostics::log_once(&std::sync::Once::new(), || line);
             if name == "present" {
                 let summary = crate::diagnostics::display::summary();

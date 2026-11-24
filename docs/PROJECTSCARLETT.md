@@ -9,6 +9,7 @@ You supply the game package. TuxBox doesn't include any game files. The recorded
 - The project's Linux build tools: Python 3.10 or newer, Rust with the `x86_64-pc-windows-msvc` target, `clang-cl`, `lld-link` and the xwin Windows SDK. [Build requirements](../examples/lanes/README.md#build-requirements)
 - Proton Experimental from Steam and `umu-run`.
 - Microsoft's Linux DXC release with `dxc` and `dxv`, for shader preparation and runtime translation. Arch's `directx-shader-compiler` 1.10.2605.37 fails on a minimal compute shader. Use Microsoft's release instead. [DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+- The Windows x64 `dxcompiler.dll` and `dxil.dll` from Microsoft's DXC release. The D3D12 provider loads them in Proton to compile geometry shaders for Xbox screen rectangles. [Verified DXC release](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2505.1)
 - A C compiler and Vulkan headers. The launcher builds TuxBox's constant-buffer Vulkan layer on first use.
 
 Run `python tuxbox.py inspect /path/to/package` to confirm the package. It should report one executable entry, `GTAO  Scarlett  game_scarlett_master.exe  present`.
@@ -55,6 +56,8 @@ On a copy-on-write filesystem such as Btrfs or XFS, `--reflink=auto` copies the 
 
 Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`.
 
+Copy `bin/x64/dxcompiler.dll` and `bin/x64/dxil.dll` from the Windows DXC archive beside `game_scarlett_master.exe`. The Linux shader compiler and validator stay on the host.
+
 ## Launch offline
 
 The game installs a Breakpad crash handler that uploads minidumps to an online crash service. Run it without network access so that crashes during testing are not uploaded. On Linux, start the launcher in a new network namespace:
@@ -76,7 +79,9 @@ Configure a local stdio MCP server to run the command below. Start it from the d
 python tools/scarlett_mcp.py --package /path/to/scarlett-run --prefix build/scarlett-mcp-prefix
 ```
 
-The server uses its own launch session. `launch` starts the game offline with MangoHud. By default it reads back the presented source every 600 frames. Set `trace_interval` to zero for a run without GPU readback. `status` shows the log tail, presentation milestones and recent frame samples. `screenshot` saves the game window and returns it to the client. `press` sends a controller button through the keyboard mapping while the game has focus. `stop` requests window close. Logs and captures go under `build/scarlett-mcp/` by default.
+The server uses its own launch session. `launch` starts the game offline with MangoHud. By default it reads back the presented source every 600 frames. Set `trace_interval` to zero for a run without GPU readback or enable `trace_draws` to sample individual raster draws. `status` shows the log tail, presentation milestones and recent frame samples. `screenshot` saves the game window and returns it to the client. `press` sends a controller button through the keyboard mapping while the game has focus. Set `focus` to request window focus before sending the button. `stop` requests window close. Logs and captures go under `build/scarlett-mcp/` by default.
+
+The `primary_plane_only` diagnostic presents plane zero when the title submits two planes. With GPU readback enabled, it also samples a compatible secondary plane and logs its RGB and alpha values. For a launch outside MCP, set `TUXBOX_PRESENT_PRIMARY_PLANE=1` before running TuxBox.
 
 ## Shader preparation
 
@@ -89,3 +94,20 @@ The game opens its Americas window, loads its archives and presents 3840×2160 f
 In a new prefix, the game stops at a breakpoint during System Init because it reads its package through the `G:` drive, as on the console, and the launcher doesn't map that drive yet. A fix is in review. [Pull request #6](https://github.com/brcly/TuxBox/pull/6)
 
 When you report a run, include the package version, executable hash, GPU and driver, Proton build, and the log printed in the first line of the launcher's output.
+
+## Radeon run milestones on November 24, 2026
+
+These runs used the matching 1.0.2.1 executable, an RX 9070 XT with Mesa RADV 26.2.7, Heroic's UMU 1.4.4 and Proton Experimental `experimental-11.0-20261112`. The staged package used read-only links to the large archives, and all launches ran offline. The packaged profile submits 3840×2160 frames internally regardless of the monitor's resolution.
+
+| Run | Verified milestone |
+| --- | --- |
+| Cold launch, `1870fd9` | Opened the Americas window and presented its first frame about eight seconds after launch. The title opened its main RPF archives through `G:` and signed in the local user. The window stayed black through the observed startup. |
+| Warm launch through MCP, `221f9ec` | Verified launch, status, window capture and close. GPU readback sampled the first presented frame and every 600th frame through sample 11. Each sample was black. After the first sample, each interval recorded 600 clears, 600 draws overall and zero draws or copies to the display targets. The launch exited with code 0 after the MCP close request at 137 seconds. |
+| Warm launch with Windows DXC | TuxBox created the screen-rectangle pipeline, and the earlier slot 86 `0x8007007e` error cleared. A stable interval of 300 frames recorded 300 display draws and 900 draws overall. All 32 samples were black through the clean exit at 183 seconds. A confirm input produced no observable in-game response. |
+| Series S profile | The title submitted two display planes. The provider returned `E_NOTIMPL` and MangoHud recorded zero presents. The window closed on request, and the still-running title process was stopped at 149 seconds. |
+| Series S with primary-plane presentation | The provider accepted the full 1920×1080 rectangle of the primary plane and presented it through the desktop swap chain. All 35 presentation samples through the clean exit at 193 seconds were black. Four per-draw samples from a 3840×2160 display resource were also black. |
+| Series S with both planes sampled | Plane zero was RGBA8 at 1920×1080. Plane one was RGBA8 at 3840×2160. Both requested full-frame mapping. Readbacks from both planes showed black RGB and zero mean alpha through the observed startup. |
+
+During the initial warm run, the title's slot 86 pipeline stream returned `0x8007007e`. TuxBox's screen-rectangle path loads Windows `dxcompiler.dll` inside the game process. Staging the Windows x64 compiler and validator from DXC v1.8.2505.1 restored that pipeline.
+
+VIctory reports working first-boot menus and intro video on its Windows backend. An xcl report for this package reached first-run setup and later hit a title fault. Both projects select the primary display plane on the host. In TuxBox, 35 shader programs that reported sampler errors without a root signature also had requests with their pipeline root attached. The rooted variants progressed past that sampler error, with several then refused on divergent wave reductions. [VIctory status](https://github.com/Marvisak/VIctory) · [VIctory presentation](https://github.com/Marvisak/VIctory/blob/main/crates/victory-gpu/src/queue.rs) · [xcl first-run report](https://github.com/ivall/xcl/issues/846) · [xcl presentation](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/d3d12x/present.rs)

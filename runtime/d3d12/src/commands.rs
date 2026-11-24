@@ -1523,7 +1523,16 @@ unsafe fn present_planes(
         return E_INVALIDARG;
     }
     if count != 1 {
-        return E_NOTIMPL;
+        static PRIMARY_ONLY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("TUXBOX_PRESENT_PRIMARY_PLANE").is_some_and(|value| value == "1")
+        });
+        if count != 2 || !*PRIMARY_ONLY {
+            return E_NOTIMPL;
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || {
+            "PresentX diagnostic: presenting the primary plane of a two-plane frame".into()
+        });
     }
     let plane = unsafe { &*planes };
     if plane.resource_count == 0 || plane.resources.is_null() {
@@ -1536,6 +1545,7 @@ unsafe fn present_planes(
     else {
         return E_INVALIDARG;
     };
+    let mut secondary = None;
     if let Some(params) = unsafe { params.as_ref() } {
         if !(0.0..=100.0).contains(&params.immediate_threshold_percent) {
             return E_INVALIDARG;
@@ -1554,8 +1564,25 @@ unsafe fn present_planes(
             || full.color_space != 0 || full.remaining != [0; 7] || params.options != [0; 7] {
             return E_NOTIMPL;
         }
+        if count == 2 {
+            // This call uses the retail array layout. The second plane is
+            // available for readback while the diagnostic displays plane zero.
+            let overlay = unsafe { &*planes.cast::<RetailPresentPlane>().add(1) };
+            if overlay.prefix.resource_count == 1 && !overlay.prefix.resources.is_null() {
+                secondary = unsafe { device::resource(*overlay.prefix.resources, parent(&queue.parent)) };
+            }
+            static OVERLAY: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&OVERLAY, || {
+                let desc = secondary.map(|resource| unsafe { resource.GetDesc() });
+                let rect = unsafe { overlay.source_rects.as_ref() };
+                let destination = unsafe { overlay.destination.as_ref() };
+                format!("secondary present plane resources={} texture={:?} source {rect:?} destination {destination:?} color {} options {:?}",
+                    overlay.prefix.resource_count, desc.map(|d| (d.Width, d.Height, d.Format.0)),
+                    overlay.color_space, overlay.remaining)
+            });
+        }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    let result = queue.state.presentation.present(&queue.native, source, secondary);
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.
     unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };
