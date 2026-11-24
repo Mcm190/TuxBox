@@ -168,7 +168,7 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: boo
     }
     let state = |s: &[u32; 13]| -> Option<(u32, u32)> {
         let [filter, u, v, w, bias, aniso, func, border, min, max, slot, space, vis] = *s;
-        if !(vis == 0 || (vis == 5 && ex.stage == Stage::Pixel))
+        if !(vis == 0 || matches!((vis, ex.stage), (1, Stage::Vertex) | (5, Stage::Pixel)))
             || (bias, aniso, min, max) != (0, 1, 0, 12.0_f32.to_bits())
             || (filter & 0x80 != 0) != compare
             || border > 2

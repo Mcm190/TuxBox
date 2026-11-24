@@ -10,6 +10,7 @@ use windows::core::Result;
 
 pub(super) enum Packet {
     Marker(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER),
+    Writes(Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER>),
     Timestamp(ID3D12QueryHeap, u32, ID3D12Resource, u64),
 }
 
@@ -20,6 +21,10 @@ impl Packet {
                 Self::Marker(write) => {
                     list.cast::<ID3D12GraphicsCommandList2>()?
                         .WriteBufferImmediate(1, write, None);
+                }
+                Self::Writes(writes) => {
+                    list.cast::<ID3D12GraphicsCommandList2>()?
+                        .WriteBufferImmediate(writes.len() as u32, writes.as_ptr(), None);
                 }
                 Self::Timestamp(heap, index, dest, offset) => {
                     list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *index);

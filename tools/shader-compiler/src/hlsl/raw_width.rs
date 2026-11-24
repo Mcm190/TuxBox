@@ -37,6 +37,7 @@ fn compute_extract(words: &[u32]) -> ShaderExtract {
         mesh_info: None,
         primitive_sig: Vec::new(),
         root_sig: None,
+        pipeline_samplers: Vec::new(),
     }
 }
 

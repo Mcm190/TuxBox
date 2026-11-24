@@ -1093,15 +1093,16 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
     if !state.ensure_open(&list.native) { return; }
     if bytes == 0 { return; }
     if source.is_null() || address == 0 || !address.is_multiple_of(4) || !bytes.is_multiple_of(4)
-        || bytes > 1 << 20 {
+        || flags != 0 || address.checked_add(u64::from(bytes)).is_none() || bytes > 1 << 20 {
         static BAD: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&BAD, || format!(
             "list slot 62 rejected source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
-        { crate::invalid_site!(); state.error = E_INVALIDARG };
+        state.error = E_INVALIDARG;
         return;
     }
     let result = (|| -> windows::core::Result<()> {
         let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, u64::from(bytes))? };
+        if dest.checked_add(u64::from(bytes)).is_none() { return Err(E_INVALIDARG.into()); }
         if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
         let words = unsafe { core::slice::from_raw_parts(source, bytes as usize) };
         let mut writes = Vec::new();
@@ -1109,9 +1110,7 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
         writes.extend(words.chunks_exact(4).enumerate().map(|(i, w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: dest + 4 * i as u64, Value: u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
         }));
-        let native = list.native.cast::<ID3D12GraphicsCommandList2>()?;
-        unsafe { native.WriteBufferImmediate(writes.len() as u32, writes.as_ptr(), None) };
-        Ok(())
+        state.prefix.push(&list.native, memory_wait::Packet::Writes(writes))
     })();
     if let Err(error) = result { state.error = error.code(); }
 }
